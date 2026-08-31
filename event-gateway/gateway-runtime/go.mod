@@ -3,6 +3,8 @@ module github.com/wso2/api-platform/event-gateway/gateway-runtime
 go 1.26.5
 
 require (
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.22.0
+	github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus v1.10.0
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
@@ -15,6 +17,20 @@ require (
 	github.com/wso2/api-platform/common v0.0.0
 	github.com/wso2/api-platform/gateway/gateway-runtime/policy-engine v0.0.0-00010101000000-000000000000
 	github.com/wso2/api-platform/sdk/core v0.4.0
+	github.com/wso2/gateway-controllers/policies/advanced-ratelimit v1.1.2
+	github.com/wso2/gateway-controllers/policies/analytics-header-filter v1.0.1
+	github.com/wso2/gateway-controllers/policies/api-key-auth v1.0.1
+	github.com/wso2/gateway-controllers/policies/basic-auth v1.0.1
+	github.com/wso2/gateway-controllers/policies/basic-ratelimit v1.1.1
+	github.com/wso2/gateway-controllers/policies/cors v1.0.2
+	github.com/wso2/gateway-controllers/policies/interceptor-service v1.0.1
+	github.com/wso2/gateway-controllers/policies/json-xml-mediator v1.0.4
+	github.com/wso2/gateway-controllers/policies/jwt-auth v1.3.0
+	github.com/wso2/gateway-controllers/policies/log-message v1.0.3
+	github.com/wso2/gateway-controllers/policies/remove-headers v1.0.1
+	github.com/wso2/gateway-controllers/policies/set-headers v1.0.1
+	github.com/wso2/gateway-controllers/policies/subscription-validation v1.0.3
+	github.com/wso2/gateway-controllers/policies/websub-hmac-auth v1.0.1
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
@@ -22,13 +38,17 @@ require (
 
 require (
 	cel.dev/expr v0.25.1 // indirect
+	github.com/Azure/azure-sdk-for-go/sdk/internal v1.12.0 // indirect
+	github.com/Azure/go-amqp v1.4.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/cel-go v0.26.1 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/knadh/koanf/maps v0.1.2 // indirect
@@ -44,6 +64,7 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
+	github.com/redis/go-redis/v9 v9.17.3 // indirect
 	github.com/stoewer/go-strcase v1.3.1 // indirect
 	github.com/twmb/franz-go/pkg/kmsg v1.13.1 // indirect
 	github.com/wso2/api-platform/httpkit v0.0.0-local // indirect
@@ -63,6 +84,6 @@ require (
 replace (
 	github.com/wso2/api-platform/common => ../../common
 	github.com/wso2/api-platform/gateway/gateway-runtime/policy-engine => ../../gateway/gateway-runtime/policy-engine
-	github.com/wso2/api-platform/sdk/core => ../../sdk/core
 	github.com/wso2/api-platform/httpkit => ../../httpkit
+	github.com/wso2/api-platform/sdk/core => ../../sdk/core
 )

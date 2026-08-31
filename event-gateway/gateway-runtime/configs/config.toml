@@ -45,6 +45,11 @@ tls = false
 # sasl_username = "egw"
 # sasl_password = "egw-pass"
 
+[asb]
+# Azure Service Bus connection string. Never commit a real value here —
+# supply it via the APIP_EGW_ASB_CONNECTION_STRING environment variable.
+# connection_string = ""
+
 [websub]
 verification_timeout_seconds = 10
 delivery_max_retries = 5

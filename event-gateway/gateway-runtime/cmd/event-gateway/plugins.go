@@ -21,6 +21,7 @@ package main
 import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/config"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
+	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors/brokerdriver/asb"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors/brokerdriver/kafka"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors/receiver/websocket"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors/receiver/websub"
@@ -38,6 +39,14 @@ func registerConnectors(registry *connectors.Registry, cfg *config.Config) {
 			return nil, err
 		}
 		return kafka.NewBrokerDriver(connectionCfg)
+	})
+
+	registry.RegisterBrokerDriver("azureservicebus", func(brokerDriverCfg map[string]interface{}) (connectors.BrokerDriver, error) {
+		connectionCfg, err := asb.ResolveConnectionConfig(cfg.ASB, brokerDriverCfg)
+		if err != nil {
+			return nil, err
+		}
+		return asb.NewBrokerDriver(connectionCfg, cfg.RuntimeID)
 	})
 
 	registry.RegisterReceiver("websub", func(ecfg connectors.ReceiverConfig) (connectors.Receiver, error) {

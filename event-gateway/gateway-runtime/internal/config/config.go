@@ -35,6 +35,7 @@ import (
 type Config struct {
 	Server       ServerConfig       `koanf:"server"`
 	Kafka        KafkaConfig        `koanf:"kafka"`
+	ASB          ASBConfig          `koanf:"asb"`
 	WebSub       WebSubConfig       `koanf:"websub"`
 	PolicyEngine PolicyEngineConfig `koanf:"policy_engine"`
 	ControlPlane ControlPlaneConfig `koanf:"controlplane"`
@@ -71,6 +72,11 @@ type KafkaConfig struct {
 	SASLMechanism       string   `koanf:"sasl_mechanism"`
 	SASLUsername        string   `koanf:"sasl_username"`
 	SASLPassword        string   `koanf:"sasl_password"`
+}
+
+// ASBConfig holds Azure Service Bus connection settings.
+type ASBConfig struct {
+	ConnectionString string `koanf:"connection_string"`
 }
 
 // WebSubConfig holds WebSub-specific settings.
@@ -201,6 +207,8 @@ func mapEnvKey(key string) string {
 		return "server." + strings.TrimPrefix(name, "server_")
 	case strings.HasPrefix(name, "kafka_"):
 		return "kafka." + strings.TrimPrefix(name, "kafka_")
+	case strings.HasPrefix(name, "asb_"):
+		return "asb." + strings.TrimPrefix(name, "asb_")
 	case strings.HasPrefix(name, "websub_"):
 		return "websub." + strings.TrimPrefix(name, "websub_")
 	case strings.HasPrefix(name, "policy_engine_"):
@@ -304,6 +312,23 @@ func validate(cfg *Config) error {
 		return err
 	}
 
+	if err := validateASBConfig(cfg.ASB); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateASBConfig fails closed on an ASB config that looks enabled but is
+// missing its connection string, rather than letting the driver fail lazily
+// on first use with a less specific error.
+func validateASBConfig(asbCfg ASBConfig) error {
+	if strings.TrimSpace(asbCfg.ConnectionString) == "" {
+		return nil
+	}
+	if !strings.HasPrefix(strings.TrimSpace(asbCfg.ConnectionString), "Endpoint=sb://") {
+		return fmt.Errorf("asb.connection_string must be a valid Service Bus connection string starting with \"Endpoint=sb://\"")
+	}
 	return nil
 }
 

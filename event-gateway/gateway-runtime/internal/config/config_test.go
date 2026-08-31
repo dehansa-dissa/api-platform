@@ -99,6 +99,34 @@ enabled = false
 	}
 }
 
+// TestLoadAppliesASBEnvironmentOverride guards against mapEnvKey's generic
+// fallback (which turns every remaining underscore into a dot) mis-mapping
+// APIP_EGW_ASB_CONNECTION_STRING to "asb.connection.string" instead of the
+// koanf tag's actual "asb.connection_string" — a real regression that shipped
+// once already and silently left cfg.ASB.ConnectionString empty regardless of
+// what the operator exported.
+func TestLoadAppliesASBEnvironmentOverride(t *testing.T) {
+	t.Setenv("APIP_EGW_ASB_CONNECTION_STRING", "Endpoint=sb://example.servicebus.windows.net/;SharedAccessKeyName=test;SharedAccessKey=dGVzdA==")
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte(`
+[kafka]
+brokers = ["localhost:9092"]
+`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, _, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	want := "Endpoint=sb://example.servicebus.windows.net/;SharedAccessKeyName=test;SharedAccessKey=dGVzdA=="
+	if cfg.ASB.ConnectionString != want {
+		t.Fatalf("expected asb connection string %q, got %q", want, cfg.ASB.ConnectionString)
+	}
+}
+
 func TestLoadRequiresWebSubTLSFilesWhenEnabled(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(configPath, []byte(`
