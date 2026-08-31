@@ -25,9 +25,23 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
+
+// subscriptionDeleter is an optional capability a broker-driver may implement
+// when its per-subscriber resource is a durable entity the broker will not
+// reclaim on its own. Kafka does not implement it — a consumer group is
+// implicit and broker-managed, so there is nothing to delete on unsubscribe.
+// Azure Service Bus does: a Subscription is a persistent entity that keeps
+// accumulating messages until it is explicitly removed.
+//
+// It is deliberately declared here rather than added to connectors.BrokerDriver
+// so that drivers with nothing to clean up need no changes at all.
+type subscriptionDeleter interface {
+	DeleteSubscription(ctx context.Context, groupID string, topic string) error
+}
 
 // managedConsumer tracks a per-callback consumer and its topic set.
 type managedConsumer struct {
@@ -141,6 +155,7 @@ func (cm *ConsumerManager) RemoveSubscription(callbackURL, kafkaTopic string) er
 	}
 
 	delete(mc.topics, kafkaTopic)
+	groupID := cm.consumerGroupID(callbackURL)
 
 	// Stop current consumer.
 	if mc.consumer != nil {
@@ -148,6 +163,17 @@ func (cm *ConsumerManager) RemoveSubscription(callbackURL, kafkaTopic string) er
 			slog.Error("Failed to stop consumer on unsubscribe", "callback", callbackURL, "error", err)
 		}
 		mc.consumer = nil
+	}
+
+	// If the driver keeps a durable per-subscriber entity, delete it for the
+	// topic being removed. Drivers that don't implement subscriptionDeleter
+	// (Kafka) skip this entirely — their consumer groups need no cleanup.
+	if deleter, ok := cm.brokerDriver.(subscriptionDeleter); ok {
+		deleteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := deleter.DeleteSubscription(deleteCtx, groupID, kafkaTopic); err != nil {
+			slog.Error("Failed to delete broker subscription on unsubscribe", "callback", callbackURL, "topic", kafkaTopic, "error", err)
+		}
+		cancel()
 	}
 
 	// If no topics remain, remove the entry entirely.
@@ -163,7 +189,6 @@ func (cm *ConsumerManager) RemoveSubscription(callbackURL, kafkaTopic string) er
 		topicList = append(topicList, t)
 	}
 
-	groupID := cm.consumerGroupID(callbackURL)
 	consumer, err := cm.createConsumer(groupID, topicList, callbackURL, "")
 	if err != nil {
 		return fmt.Errorf("failed to recreate consumer for callback %s: %w", callbackURL, err)
