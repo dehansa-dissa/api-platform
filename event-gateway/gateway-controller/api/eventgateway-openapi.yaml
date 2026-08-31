@@ -1890,6 +1890,32 @@ components:
             $ref: '#/components/schemas/Policy'
 
     # WebSubAllChannelPolicies defines policies applied to all channels for each event type.
+    WebSubApiBroker:
+      type: object
+      description: |
+        Message broker driver configuration for a WebSub API. Optional — when
+        omitted, the event gateway runtime defaults to its configured Kafka
+        broker, preserving behavior for every WebSubApi created before this
+        field existed. Unlike WebBrokerApiBroker, only `type` is required:
+        WebSub channels commonly select a broker type (e.g. azureservicebus)
+        while relying on the runtime's own globally-configured connection
+        details (see event-gateway's [asb]/[kafka] config sections) rather
+        than repeating per-API connection properties.
+      required:
+        - type
+      properties:
+        name:
+          type: string
+          description: Broker driver name
+          example: asb-driver
+        type:
+          type: string
+          description: Broker driver type
+          example: azureservicebus
+        properties:
+          type: object
+          description: Broker driver properties overriding the runtime's global configuration for this API (e.g., a per-API connection string).
+          additionalProperties: true
     WebhookAPIData:
       type: object
       required:
@@ -1897,6 +1923,8 @@ components:
         - version
         - context
       properties:
+        broker:
+          $ref: '#/components/schemas/WebSubApiBroker'
         displayName:
           type: string
           description: Human-readable API name (must be URL-friendly - only letters, numbers, spaces, hyphens, underscores, and dots allowed)

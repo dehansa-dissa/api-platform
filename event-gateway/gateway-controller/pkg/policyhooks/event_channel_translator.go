@@ -189,13 +189,30 @@ func (t *EventChannelTranslator) buildEventChannelResourceForWebSub(uuid string,
 		}
 	}
 
+	// brokerDriver stays a zero-value/omitted-field map when spec.Broker is
+	// nil — resolveBrokerDriver on the runtime side (gateway-runtime/internal/
+	// xdsclient/handler.go) treats an empty Type as "kafka", so an existing
+	// WebSubApi with no broker configured keeps behaving exactly as before
+	// this field existed.
+	brokerDriver := map[string]interface{}{}
+	if spec.Broker != nil {
+		brokerDriver["type"] = spec.Broker.Type
+		if spec.Broker.Name != nil {
+			brokerDriver["name"] = *spec.Broker.Name
+		}
+		if spec.Broker.Properties != nil {
+			brokerDriver["properties"] = *spec.Broker.Properties
+		}
+	}
+
 	data := map[string]interface{}{
-		"uuid":     uuid,
-		"name":     string(webSubCfg.Metadata.Name),
-		"kind":     "WebSubApi",
-		"context":  spec.Context,
-		"version":  spec.Version,
-		"channels": channelEntries,
+		"uuid":          uuid,
+		"name":          string(webSubCfg.Metadata.Name),
+		"kind":          "WebSubApi",
+		"context":       spec.Context,
+		"version":       spec.Version,
+		"channels":      channelEntries,
+		"broker-driver": brokerDriver,
 		"receiver": map[string]interface{}{
 			"type": "websub",
 		},
