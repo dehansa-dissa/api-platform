@@ -360,12 +360,8 @@ func (h *Handler) resolveBrokerDriver(bd BrokerDriverEntry) binding.BrokerDriver
 
 	cfg := bd.Properties
 	if len(cfg) == 0 && driverType == "kafka" {
-		// Use the event gateway's own Kafka brokers. Only applies when the
-		// resolved driver is actually Kafka — an azureservicebus (or any
-		// other non-Kafka) binding with no explicit properties should fall
-		// through to that driver's own global-config default (see
-		// asb.ResolveConnectionConfig) instead of being handed Kafka-shaped
-		// config it has no use for.
+		// Kafka only: other drivers fall through to their own global config
+		// rather than being handed Kafka-shaped keys they have no use for.
 		cfg = map[string]interface{}{
 			"brokers":         h.kafkaConfig.Brokers,
 			"tls":             h.kafkaConfig.TLS,

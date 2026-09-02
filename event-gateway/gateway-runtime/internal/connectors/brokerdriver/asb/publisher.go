@@ -30,21 +30,16 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// Application-property keys used to round-trip connectors.Message fields that
-// don't map onto native ASB message fields. ASB has no concept of a Kafka-style
-// tombstone (a record with a nil value used to signal deletion in a compacted
-// topic), so it is encoded explicitly via applyPropertyTombstone.
+// Application-property keys for connectors.Message fields with no native ASB
+// equivalent. ASB has no Kafka-style tombstone, so it is encoded explicitly.
 const (
 	applyPropertyTombstone = "x-eventgateway-tombstone"
 	applyPropertyKey       = "x-eventgateway-key"
 	applyPropertyHeaders   = "x-eventgateway-headers"
 )
 
-// Publisher publishes events to Azure Service Bus topics.
-//
-// Unlike Kafka, where one client addresses every topic, an ASB sender is bound
-// to a single entity — so the Publisher caches one sender per topic (or queue,
-// for the replayer's snapshot and leader-lock entities) and reuses it.
+// Publisher publishes events to Azure Service Bus topics. An ASB sender is
+// bound to one entity, so senders are cached per topic or queue and reused.
 type Publisher struct {
 	client *azservicebus.Client
 
@@ -78,8 +73,7 @@ func (p *Publisher) Publish(ctx context.Context, topic string, msg *connectors.M
 	return nil
 }
 
-// senderFor returns a cached sender for the given topic or queue, creating one
-// on first use.
+// senderFor returns a cached sender, creating one on first use.
 func (p *Publisher) senderFor(entity string) (*azservicebus.Sender, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -96,8 +90,7 @@ func (p *Publisher) senderFor(entity string) (*azservicebus.Sender, error) {
 	return sender, nil
 }
 
-// closeSender closes and forgets the cached sender for one entity, so a
-// deleted topic/queue doesn't leave a live AMQP link behind.
+// closeSender drops the cached sender so a deleted entity leaves no live link.
 func (p *Publisher) closeSender(entity string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -123,10 +116,8 @@ func (p *Publisher) Close() {
 	p.senders = make(map[string]*azservicebus.Sender)
 }
 
-// toServiceBusMessage converts a connectors.Message into an ASB send message.
-// msg.Value == nil is encoded as an explicit tombstone marker (see
-// applyPropertyTombstone) rather than as an empty body, so a genuinely empty
-// (but present) value is never confused with a deletion on the receive side.
+// toServiceBusMessage encodes a connectors.Message for ASB. A nil Value becomes
+// an explicit tombstone marker, so an empty-but-present value stays distinct.
 func toServiceBusMessage(msg *connectors.Message) (*azservicebus.Message, error) {
 	sbMsg := &azservicebus.Message{
 		ApplicationProperties: map[string]any{},
@@ -140,9 +131,7 @@ func toServiceBusMessage(msg *connectors.Message) (*azservicebus.Message, error)
 
 	if len(msg.Key) > 0 {
 		sbMsg.ApplicationProperties[applyPropertyKey] = base64.StdEncoding.EncodeToString(msg.Key)
-		// MessageID drives ASB's own duplicate-detection feature (when enabled
-		// on the entity) and gives operators a stable, human-inspectable
-		// identifier in the Azure portal/CLI for the record's compaction key.
+		// MessageID drives ASB duplicate detection and is visible in the portal.
 		keyStr := string(msg.Key)
 		sbMsg.MessageID = &keyStr
 	}

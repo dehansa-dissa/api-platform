@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
@@ -33,10 +34,13 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
+// cacheSubscriptionReleaseTimeout bounds shutdown cleanup so an unreachable
+// namespace cannot stall process exit.
+const cacheSubscriptionReleaseTimeout = 10 * time.Second
+
 // ASBBrokerDriver implements connectors.BrokerDriver for Azure Service Bus.
-// It owns a shared publisher and admin client, creates receivers on demand,
-// and tracks per-compacted-topic leader-election state (see replayer.go)
-// started by EnsureCompactedTopic and torn down by Close.
+// It owns a shared publisher and admin client and tracks per-compacted-topic
+// leader-election state (see replayer.go).
 type ASBBrokerDriver struct {
 	publisher  *Publisher
 	cfg        ConnectionConfig
@@ -55,18 +59,12 @@ func NewClient(cfg ConnectionConfig) (*azservicebus.Client, error) {
 	return azservicebus.NewClientFromConnectionString(cfg.ConnectionString, nil)
 }
 
-// NewBrokerDriver creates an Azure Service Bus broker-driver backed by the
-// given connection config.
+// NewBrokerDriver creates an ASB broker-driver from the given connection config.
 //
-// runtimeID identifies this process for the internal, per-instance ASB
-// subscriptions EnsureCompactedTopic creates to keep a live state cache (see
-// replayer.go). It should be a stable identity across restarts of the same
-// instance (for example a Kubernetes pod name/ordinal set explicitly via
-// runtime_id in config) — event-gateway auto-generates a fresh random
-// RuntimeID on every boot when left unset, which works fine for Kafka
-// (consumer groups are broker-managed and don't accumulate backlog when idle)
-// but for ASB means every restart leaves one orphaned Subscription entity per
-// compacted topic unless the operator pins a stable runtime_id.
+// runtimeID names this process's internal cache subscriptions (see replayer.go)
+// and must be stable across restarts — event-gateway generates a random one
+// when runtime_id is unset, which leaves an orphaned Subscription per compacted
+// topic on every restart.
 func NewBrokerDriver(cfg ConnectionConfig, runtimeID string) (*ASBBrokerDriver, error) {
 	client, err := NewClient(cfg)
 	if err != nil {
@@ -107,11 +105,8 @@ func (e *ASBBrokerDriver) TopicExists(ctx context.Context, topic string) (bool, 
 }
 
 // EnsureTopics creates topics if they don't already exist (idempotent).
-// metadata is an optional map of topic name -> key-value pairs for
-// logging/tracking purposes. For WebSubAPI topics, metadata typically
-// includes: apiName, apiVersion, channelName.
-// Note: metadata is logged but not stored in ASB (topic properties have no
-// place for arbitrary key-value pairs).
+// metadata is logged for tracking but not stored — ASB topic properties have
+// no place for arbitrary key-value pairs.
 func (e *ASBBrokerDriver) EnsureTopics(ctx context.Context, topics []string, metadata map[string]map[string]string) error {
 	for _, topic := range topics {
 		if _, err := e.admin.CreateTopic(ctx, topic, nil); err != nil {
@@ -137,17 +132,19 @@ func (e *ASBBrokerDriver) EnsureTopics(ctx context.Context, topics []string, met
 	return nil
 }
 
-// Close shuts down the shared publisher, client, and any running
-// leader-election goroutines for compacted topics.
+// Close shuts down the publisher, client, and leader-election goroutines.
 func (e *ASBBrokerDriver) Close() error {
 	var closeErr error
 	e.closeOnce.Do(func() {
 		e.compactedMu.Lock()
+		topics := make([]string, 0, len(e.compacted))
 		for topic := range e.compacted {
+			topics = append(topics, topic)
 			e.stopCompactedTopicLocked(topic)
 		}
 		e.compactedMu.Unlock()
 
+		e.releaseCacheSubscriptions(topics)
 		e.publisher.Close()
 
 		if err := e.client.Close(context.Background()); err != nil {
@@ -157,11 +154,30 @@ func (e *ASBBrokerDriver) Close() error {
 	return closeErr
 }
 
-// DeleteTopics deletes the given ASB topics, along with the snapshot and
-// leader-lock queues EnsureCompactedTopic provisioned alongside any compacted
-// topic. Mirrors the Kafka driver's best-effort semantics: a per-entity
-// failure is logged, not returned, so a caller tearing down a binding is not
-// blocked by one already-gone entity.
+// releaseCacheSubscriptions drops this instance's cache subscriptions on a
+// graceful shutdown. AutoDeleteOnIdle would reclaim them eventually; doing it
+// here returns the quota immediately on a scale-down, which is the common case.
+// Best-effort: a failure here is a delayed reclaim, not a lost shutdown.
+func (e *ASBBrokerDriver) releaseCacheSubscriptions(topics []string) {
+	if len(topics) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cacheSubscriptionReleaseTimeout)
+	defer cancel()
+
+	subscriptionName := cacheSubscriptionName(e.instanceID)
+	for _, topic := range topics {
+		if _, err := e.admin.DeleteSubscription(ctx, topic, subscriptionName, nil); err != nil && !isNotFoundErr(err) {
+			slog.Warn("Failed to release cache subscription on shutdown",
+				"topic", topic, "subscription", subscriptionName, "error", err)
+		}
+	}
+}
+
+// DeleteTopics deletes the given topics plus any compaction side-queues.
+// Best-effort like the Kafka driver: per-entity failures are logged, not
+// returned, so one already-gone entity does not block a teardown.
 func (e *ASBBrokerDriver) DeleteTopics(ctx context.Context, topics []string) error {
 	for _, topic := range topics {
 		e.publisher.closeSender(topic)
@@ -177,22 +193,11 @@ func (e *ASBBrokerDriver) DeleteTopics(ctx context.Context, topics []string) err
 	return nil
 }
 
-// deleteCompactionQueues removes the side-entities EnsureCompactedTopic
-// creates for a compacted topic. Without this, a redeployed API reads back a
-// stale snapshot and resurrects subscriptions that were deleted with the
-// topic. Both are best-effort: a plain (non-compacted) topic simply has no
-// such queues, and the resulting 404 is expected.
+// deleteCompactionQueues removes EnsureCompactedTopic's side-entities, without
+// which a redeployed API would resurrect subscriptions from a stale snapshot.
+// A plain topic has no such queues, so 404 is expected.
 func (e *ASBBrokerDriver) deleteCompactionQueues(ctx context.Context, topic string) {
-	snapshotQueue, err := snapshotQueueName(topic)
-	if err != nil {
-		return
-	}
-	lockQueue, err := leaderLockQueueName(topic)
-	if err != nil {
-		return
-	}
-
-	for _, queue := range []string{snapshotQueue, lockQueue} {
+	for _, queue := range []string{snapshotQueueName(topic), leaderLockQueueName(topic)} {
 		e.publisher.closeSender(queue)
 		if _, err := e.admin.DeleteQueue(ctx, queue, nil); err != nil {
 			if !isNotFoundErr(err) {
@@ -204,24 +209,24 @@ func (e *ASBBrokerDriver) deleteCompactionQueues(ctx context.Context, topic stri
 	}
 }
 
-// isConflictErr reports whether err represents an ASB "entity already exists"
-// (HTTP 409) response — not a real failure for idempotent create calls.
+// isConflictErr reports an ASB "entity already exists" (HTTP 409) response.
 func isConflictErr(err error) bool {
 	var respErr *azcore.ResponseError
 	return errors.As(err, &respErr) && respErr.StatusCode == http.StatusConflict
 }
 
-// isNotFoundErr reports whether err represents an ASB "entity not found"
-// (HTTP 404) response.
+// isNotFoundErr reports an ASB "entity not found" (HTTP 404) response.
 func isNotFoundErr(err error) bool {
 	var respErr *azcore.ResponseError
-	return errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound
+	if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
+		return true
+	}
+	var sbErr *azservicebus.Error
+	return errors.As(err, &sbErr) && sbErr.Code == azservicebus.CodeNotFound
 }
 
-// isSBTimeoutErr reports whether err is an *azservicebus.Error with
-// CodeTimeout — the code returned both when no session is currently available
-// and when a specific session ID is already locked by another receiver. Both
-// are expected, retryable outcomes of a leader-election attempt, not failures.
+// isSBTimeoutErr reports CodeTimeout, returned both when no session is
+// available and when one is already locked. Both are expected during election.
 func isSBTimeoutErr(err error) bool {
 	var sbErr *azservicebus.Error
 	return errors.As(err, &sbErr) && sbErr.Code == azservicebus.CodeTimeout

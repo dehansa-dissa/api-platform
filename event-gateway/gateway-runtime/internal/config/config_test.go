@@ -127,6 +127,30 @@ brokers = ["localhost:9092"]
 	}
 }
 
+// TestLoadAppliesASBIdleTimeoutEnvironmentOverride covers the other half of the
+// env path: mapEnvValue only runs strconv.Atoi for paths it lists explicitly, so
+// an int field left off that list arrives as a string.
+func TestLoadAppliesASBIdleTimeoutEnvironmentOverride(t *testing.T) {
+	t.Setenv("APIP_EGW_ASB_SUBSCRIPTION_IDLE_TIMEOUT_SECONDS", "300")
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte(`
+[kafka]
+brokers = ["localhost:9092"]
+`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, _, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.ASB.SubscriptionIdleTimeoutSeconds != 300 {
+		t.Fatalf("expected idle timeout 300, got %d", cfg.ASB.SubscriptionIdleTimeoutSeconds)
+	}
+}
+
 func TestLoadRequiresWebSubTLSFilesWhenEnabled(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(configPath, []byte(`

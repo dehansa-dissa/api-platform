@@ -30,15 +30,10 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// subscriptionDeleter is an optional capability a broker-driver may implement
-// when its per-subscriber resource is a durable entity the broker will not
-// reclaim on its own. Kafka does not implement it — a consumer group is
-// implicit and broker-managed, so there is nothing to delete on unsubscribe.
-// Azure Service Bus does: a Subscription is a persistent entity that keeps
-// accumulating messages until it is explicitly removed.
-//
-// It is deliberately declared here rather than added to connectors.BrokerDriver
-// so that drivers with nothing to clean up need no changes at all.
+// subscriptionDeleter is an optional capability for drivers whose per-subscriber
+// resource is a durable entity the broker will not reclaim on its own. Kafka
+// consumer groups need no cleanup; an ASB Subscription does. Declared here
+// rather than on connectors.BrokerDriver so other drivers need no changes.
 type subscriptionDeleter interface {
 	DeleteSubscription(ctx context.Context, groupID string, topic string) error
 }
@@ -165,9 +160,7 @@ func (cm *ConsumerManager) RemoveSubscription(callbackURL, kafkaTopic string) er
 		mc.consumer = nil
 	}
 
-	// If the driver keeps a durable per-subscriber entity, delete it for the
-	// topic being removed. Drivers that don't implement subscriptionDeleter
-	// (Kafka) skip this entirely — their consumer groups need no cleanup.
+	// Drivers without a durable per-subscriber entity (Kafka) skip this.
 	if deleter, ok := cm.brokerDriver.(subscriptionDeleter); ok {
 		deleteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := deleter.DeleteSubscription(deleteCtx, groupID, kafkaTopic); err != nil {

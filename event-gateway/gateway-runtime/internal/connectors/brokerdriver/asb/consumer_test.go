@@ -1,16 +1,19 @@
 package asb
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// toReceived simulates what the ASB SDK does when it hands back a message
-// previously sent via toServiceBusMessage: Body and ApplicationProperties
-// round-trip verbatim over the wire.
 func toReceived(sb *azservicebus.Message) *azservicebus.ReceivedMessage {
 	return &azservicebus.ReceivedMessage{
 		Body:                  sb.Body,
@@ -49,7 +52,7 @@ func TestMessageRoundTrip_ValueKeyAndHeaders(t *testing.T) {
 func TestMessageRoundTrip_TombstoneIsPreserved(t *testing.T) {
 	original := &connectors.Message{
 		Key:   []byte("topic-1:https://example.com/callback"),
-		Value: nil, // tombstone
+		Value: nil,
 	}
 
 	sb, err := toServiceBusMessage(original)
@@ -110,36 +113,47 @@ func TestMessageRoundTrip_NoKeyOrHeaders(t *testing.T) {
 	}
 }
 
-func TestValidateSubscriptionName_RejectsEmpty(t *testing.T) {
-	if err := validateSubscriptionName(""); err == nil {
-		t.Fatal("expected error for empty subscription name")
+func TestBackoffDelay_GrowsAndStaysWithinJitterBounds(t *testing.T) {
+	for attempt := 0; attempt < 5; attempt++ {
+		base := receiveRetryBase << attempt
+		for i := 0; i < 50; i++ {
+			got := backoffDelay(attempt)
+			if got < base || got >= base+base/2 {
+				t.Fatalf("backoffDelay(%d) = %s, want [%s, %s)", attempt, got, base, base+base/2)
+			}
+		}
 	}
 }
 
-func TestValidateSubscriptionName_RejectsOverLimit(t *testing.T) {
-	// One character over the 50-character ASB subscription-name limit.
-	overLimit := make([]byte, maxSubscriptionNameLength+1)
-	for i := range overLimit {
-		overLimit[i] = 'a'
-	}
-	if err := validateSubscriptionName(string(overLimit)); err == nil {
-		t.Fatal("expected error for subscription name exceeding the ASB limit")
-	}
-}
-
-func TestValidateSubscriptionName_AcceptsExactLimit(t *testing.T) {
-	exactly := make([]byte, maxSubscriptionNameLength)
-	for i := range exactly {
-		exactly[i] = 'a'
-	}
-	if err := validateSubscriptionName(string(exactly)); err != nil {
-		t.Fatalf("expected name at exactly the ASB limit to be accepted, got error: %v", err)
+func TestBackoffDelay_CapsAtMaximum(t *testing.T) {
+	for _, attempt := range []int{5, 10, 64} {
+		got := backoffDelay(attempt)
+		if got < receiveRetryMax || got >= receiveRetryMax+receiveRetryMax/2 {
+			t.Fatalf("backoffDelay(%d) = %s, want it capped within [%s, %s)",
+				attempt, got, receiveRetryMax, receiveRetryMax+receiveRetryMax/2)
+		}
 	}
 }
 
-// TestSubscriptionNameFor_PassesThroughRealisticWebSubGroupID pins the common
-// case: the WebSub ConsumerManager's group ID fits comfortably, so it must
-// reach ASB unchanged and stay legible in the portal.
+func TestBackoffDelay_JittersSoReplicasDoNotRetryInLockstep(t *testing.T) {
+	seen := make(map[time.Duration]struct{})
+	for i := 0; i < 100; i++ {
+		seen[backoffDelay(3)] = struct{}{}
+	}
+	if len(seen) == 1 {
+		t.Fatal("backoffDelay returned a constant delay; replicas would retry in lockstep")
+	}
+}
+
+func TestSleepBackoff_ReturnsFalseOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if sleepBackoff(ctx, 10) {
+		t.Fatal("expected sleepBackoff to report a cancelled context rather than waiting out the delay")
+	}
+}
+
 func TestSubscriptionNameFor_PassesThroughRealisticWebSubGroupID(t *testing.T) {
 	groupID := "event-gateway-websub-a1b2c3d4e5f60718"
 	got, err := subscriptionNameFor(groupID)
@@ -151,9 +165,6 @@ func TestSubscriptionNameFor_PassesThroughRealisticWebSubGroupID(t *testing.T) {
 	}
 }
 
-// TestSubscriptionNameFor_HashesRealisticWebSocketGroupID covers the case that
-// used to fail outright: the per-connection WebSocket paths build
-// prefix + "-ws-" + a UUID, which is 53 characters — over ASB's limit.
 func TestSubscriptionNameFor_HashesRealisticWebSocketGroupID(t *testing.T) {
 	groupID := "event-gateway-ws-3f8a1c72-9b4e-4d21-a5f6-7e0c1d2b3a49"
 	if len(groupID) <= maxSubscriptionNameLength {
@@ -165,8 +176,9 @@ func TestSubscriptionNameFor_HashesRealisticWebSocketGroupID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscriptionNameFor returned error: %v", err)
 	}
-	if err := validateSubscriptionName(got); err != nil {
-		t.Fatalf("subscriptionNameFor() = %q is not a valid ASB subscription name: %v", got, err)
+	if got == "" || len(got) > maxSubscriptionNameLength {
+		t.Fatalf("subscriptionNameFor() = %q is %d characters, outside the 1-%d ASB limit",
+			got, len(got), maxSubscriptionNameLength)
 	}
 }
 
@@ -192,18 +204,22 @@ func TestSubscriptionNameFor_RejectsEmpty(t *testing.T) {
 	}
 }
 
-// TestConsumerEphemeralFlag_MatchesConstructorIntent guards the invariant the
-// cleanup depends on: only the auto-complete constructor (used by the
-// per-connection WebSocket paths) marks its subscriptions for deletion on
-// Stop. Durable subscribers must never be marked, or unsubscribing one
-// callback would tear down state that outlives it.
-func TestConsumerEphemeralFlag_MatchesConstructorIntent(t *testing.T) {
-	if got := (&Consumer{ephemeral: true}).ephemeral; !got {
-		t.Fatal("expected ephemeral consumers to be flagged for cleanup")
+func TestIsNotFoundErr_MatchesManagementAndAMQPForms(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want bool
+	}{
+		"management 404":  {&azcore.ResponseError{StatusCode: http.StatusNotFound}, true},
+		"amqp notfound":   {&azservicebus.Error{Code: azservicebus.CodeNotFound}, true},
+		"wrapped amqp":    {fmt.Errorf("receive: %w", &azservicebus.Error{Code: azservicebus.CodeNotFound}), true},
+		"management 409":  {&azcore.ResponseError{StatusCode: http.StatusConflict}, false},
+		"amqp conn lost":  {&azservicebus.Error{Code: azservicebus.CodeConnectionLost}, false},
+		"unrelated error": {errors.New("boom"), false},
 	}
-	// A durable consumer with no driver reference must not attempt deletion.
-	durable := &Consumer{ephemeral: false}
-	if durable.ephemeral {
-		t.Fatal("durable consumers must never be flagged ephemeral")
+
+	for name, tc := range cases {
+		if got := isNotFoundErr(tc.err); got != tc.want {
+			t.Fatalf("%s: isNotFoundErr = %v, want %v", name, got, tc.want)
+		}
 	}
 }

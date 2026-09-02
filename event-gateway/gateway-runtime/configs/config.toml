@@ -72,6 +72,9 @@ tls = false
 # Azure Service Bus connection string. Never commit a real value here —
 # supply it via the APIP_EGW_ASB_CONNECTION_STRING environment variable.
 # connection_string = ""
+# How long Azure keeps one of the driver's internal subscriptions alive with no
+# activity before reclaiming it.
+subscription_idle_timeout_seconds = 3600
 
 [websub]
 verification_timeout_seconds = 10

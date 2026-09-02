@@ -24,36 +24,49 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/admin"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
 // Azure Service Bus caps a subscription name at 50 characters.
 const maxSubscriptionNameLength = 50
 
-// settleMode controls how a Consumer settles a message after the handler runs,
-// matching the two Kafka consumer variants:
-//   - settleAutoComplete: always Complete, regardless of handler outcome. Used
-//     for Subscribe/Watch, mirroring Kafka's auto-commit Consumer, which
-//     advances past a record whether or not the handler succeeded.
-//   - settleOnHandlerResult: Complete on success, DeadLetter on failure. Used
-//     for SubscribeManual.
-//
-// Neither mode uses AbandonMessage on handler failure. AbandonMessage would
-// make ASB immediately redeliver the message and re-drive the handler, which
-// for the WebSub delivery path (see consumer_manager.go) would duplicate the
-// Deliverer's own retry-with-backoff — by the time the handler returns an
-// error there, the Deliverer has already exhausted its own retries, so a
-// second, independent redelivery loop would only re-attempt a delivery that
-// has already been given every retry it's going to get. DeadLettering instead
-// keeps the failure visible (in the subscription's dead-letter subqueue)
-// without double-retrying. A message lock that expires because the process
-// crashed mid-handling (not because the handler returned an error) still
-// redelivers normally — that's the intended crash-recovery path, not a retry
-// mechanism.
+const (
+	receiveRetryBase = time.Second
+	receiveRetryMax  = 30 * time.Second
+)
+
+// backoffDelay grows the retry interval exponentially to receiveRetryMax and
+// adds jitter, so replicas that lost the namespace together do not retry in
+// lockstep and stampede it on recovery.
+func backoffDelay(attempt int) time.Duration {
+	delay := receiveRetryMax
+	if attempt < 5 {
+		delay = receiveRetryBase << attempt
+	}
+	return delay + rand.N(delay/2)
+}
+
+// sleepBackoff waits out a failed receive, reporting false if ctx ended first.
+func sleepBackoff(ctx context.Context, attempt int) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(backoffDelay(attempt)):
+		return true
+	}
+}
+
+// settleMode mirrors the two Kafka consumer variants. Handler failure never
+// abandons the message: that would have ASB re-drive the handler, duplicating
+// the Deliverer's retry-with-backoff, which by then is exhausted. A lock
+// expiring from a crash still redelivers — crash recovery, not retry.
 type settleMode int
 
 const (
@@ -68,19 +81,14 @@ type Consumer struct {
 	handler  connectors.MessageHandler
 	mode     settleMode
 
-	// ephemeral marks a subscription whose lifetime is exactly this
-	// consumer's: Stop deletes it from the namespace instead of leaving it
-	// behind. Set only by NewConsumer, whose callers (the per-connection
-	// WebSocket paths) mint a fresh groupID per connection — without this
-	// every connection would strand a durable ASB Subscription that nothing
-	// ever removes, and ASB caps subscriptions at 2,000 per topic.
-	//
-	// Durable subscribers leave this false: NewManualCommitConsumer (WebSub
-	// delivery, deleted explicitly on unsubscribe) and Watch (cross-instance
-	// sync, whose read position must survive restarts).
+	// ephemeral: Stop deletes the subscription. Set only by NewConsumer, whose
+	// WebSocket callers mint a groupID per connection.
 	ephemeral bool
-	driver    *ASBBrokerDriver
-	groupID   string
+	// disposable: the subscription carries AutoDeleteOnIdle, so reopen must
+	// recreate it the same way rather than as a durable one.
+	disposable bool
+	driver     *ASBBrokerDriver
+	groupID    string
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -97,9 +105,8 @@ func (c *Consumer) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops the consumer, waits for the consume loop to exit, and closes the
-// underlying ASB receiver link. An ephemeral consumer also deletes its
-// subscription, since nothing else will.
+// Stop halts the consume loop and closes the receiver. An ephemeral consumer
+// also deletes its subscription, since nothing else will.
 func (c *Consumer) Stop(ctx context.Context) error {
 	if c.cancel != nil {
 		c.cancel()
@@ -118,6 +125,7 @@ func (c *Consumer) Stop(ctx context.Context) error {
 }
 
 func (c *Consumer) consumeLoop(ctx context.Context) {
+	attempt := 0
 	for {
 		if ctx.Err() != nil {
 			return
@@ -128,20 +136,55 @@ func (c *Consumer) consumeLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			slog.Error("ASB consumer receive error", "topic", c.topic, "error", err)
-			// Avoid a tight error loop against a misbehaving/unreachable namespace.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
+			if isNotFoundErr(err) && c.reopen(ctx) == nil {
+				slog.Info("Recreated reclaimed asb subscription",
+					"topic", c.topic, "subscription", c.groupID)
+				attempt = 0
+				continue
 			}
+			slog.Error("ASB consumer receive error", "topic", c.topic, "error", err)
+			if !sleepBackoff(ctx, attempt) {
+				return
+			}
+			attempt++
 			continue
 		}
+		attempt = 0
 
 		for _, rm := range messages {
 			c.handleMessage(ctx, rm)
 		}
 	}
+}
+
+// reopen recreates a subscription that vanished underneath the receiver and
+// rebuilds the receiver on it. AutoDeleteOnIdle makes this reachable for the
+// driver's disposable subscriptions; an operator deleting one by hand reaches
+// it for any of them, where the alternative is a consumer that fails silently
+// until the process restarts.
+func (c *Consumer) reopen(ctx context.Context) error {
+	if c.driver == nil || c.groupID == "" {
+		return fmt.Errorf("consumer is not bound to a driver")
+	}
+
+	ensure := c.driver.ensureSubscription
+	if c.disposable {
+		ensure = c.driver.ensureDisposableSubscription
+	}
+	if err := ensure(ctx, c.topic, c.groupID); err != nil {
+		return err
+	}
+
+	receiver, err := c.driver.client.NewReceiverForSubscription(c.topic, c.groupID, &azservicebus.ReceiverOptions{
+		ReceiveMode: azservicebus.ReceiveModePeekLock,
+	})
+	if err != nil {
+		return err
+	}
+
+	_ = c.receiver.Close(ctx)
+	c.receiver = receiver
+	return nil
 }
 
 func (c *Consumer) handleMessage(ctx context.Context, rm *azservicebus.ReceivedMessage) {
@@ -178,19 +221,13 @@ func (c *Consumer) handleMessage(ctx context.Context, rm *azservicebus.ReceivedM
 	}
 }
 
-// MultiTopicConsumer fans Start/Stop out to one Consumer per topic, so a
-// single subscriber reading several topics (see ConsumerManager) is still
-// exposed as one connectors.Receiver. Kafka gets this for free — one client
-// consumes many topics — while an ASB receiver is bound to a single entity.
+// MultiTopicConsumer exposes one Consumer per topic as a single connectors.Receiver.
 type MultiTopicConsumer struct {
 	consumers []*Consumer
 }
 
-// Start begins consuming on every topic, unwinding cleanly if any fails.
-// Stop is safe on a consumer that never started, so the unwind covers the
-// whole set rather than only the ones already running — otherwise the
-// remainder would strand open receivers and, for ephemeral consumers, their
-// subscriptions.
+// Start begins consuming on every topic. On failure the whole set is stopped:
+// Stop is safe on an unstarted consumer, and the rest would strand receivers.
 func (m *MultiTopicConsumer) Start(ctx context.Context) error {
 	for _, c := range m.consumers {
 		if err := c.Start(ctx); err != nil {
@@ -214,20 +251,16 @@ func (m *MultiTopicConsumer) Stop(ctx context.Context) error {
 	return firstErr
 }
 
-// NewConsumer creates a consumer that auto-completes every message regardless
-// of handler outcome, mirroring the Kafka driver's auto-commit Consumer.
-//
-// Subscriptions created here are ephemeral — Stop deletes them. Callers that
-// need the subscription to outlive the consumer must use
-// NewManualCommitConsumer or Watch instead.
+// NewConsumer creates a consumer that auto-completes every message, mirroring
+// the Kafka driver's auto-commit Consumer. Its subscriptions are ephemeral:
+// Stop deletes them. Callers needing durability use NewManualCommitConsumer.
 func NewConsumer(e *ASBBrokerDriver, groupID string, topics []string, handler connectors.MessageHandler) (*MultiTopicConsumer, error) {
 	return newMultiTopicConsumer(e, groupID, topics, handler, settleAutoComplete, true)
 }
 
-// NewManualCommitConsumer creates a consumer that completes on handler success
-// and dead-letters on handler failure — the ASB analogue of Kafka's manual
-// offset commit, where a failed record must not be silently advanced past.
-// The subscription is durable and survives Stop.
+// NewManualCommitConsumer completes on handler success and dead-letters on
+// failure — the ASB analogue of Kafka's manual offset commit. The subscription
+// is durable and survives Stop.
 func NewManualCommitConsumer(e *ASBBrokerDriver, groupID string, topics []string, handler connectors.MessageHandler) (*MultiTopicConsumer, error) {
 	return newMultiTopicConsumer(e, groupID, topics, handler, settleOnHandlerResult, false)
 }
@@ -245,9 +278,7 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 	consumers := make([]*Consumer, 0, len(topics))
 	created := make([]string, 0, len(topics))
 
-	// unwind releases everything this call has built so far. Ephemeral
-	// subscriptions are deleted too: nothing else knows about them, so a
-	// half-built consumer would otherwise strand them in the namespace.
+	// Ephemeral subscriptions are deleted too: nothing else knows about them.
 	unwind := func() {
 		for _, c := range consumers {
 			if err := c.receiver.Close(ctx); err != nil {
@@ -265,8 +296,13 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 		}
 	}
 
+	ensure := e.ensureSubscription
+	if ephemeral {
+		ensure = e.ensureDisposableSubscription
+	}
+
 	for _, topic := range topics {
-		if err := e.ensureSubscription(ctx, topic, subscriptionName); err != nil {
+		if err := ensure(ctx, topic, subscriptionName); err != nil {
 			unwind()
 			return nil, fmt.Errorf("failed to ensure asb subscription %s on topic %s: %w", subscriptionName, topic, err)
 		}
@@ -281,40 +317,38 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 		}
 
 		consumers = append(consumers, &Consumer{
-			receiver:  receiver,
-			topic:     topic,
-			handler:   handler,
-			mode:      mode,
-			ephemeral: ephemeral,
-			driver:    e,
-			groupID:   subscriptionName,
+			receiver:   receiver,
+			topic:      topic,
+			handler:    handler,
+			mode:       mode,
+			ephemeral:  ephemeral,
+			disposable: ephemeral,
+			driver:     e,
+			groupID:    subscriptionName,
 		})
 	}
 
 	return &MultiTopicConsumer{consumers: consumers}, nil
 }
 
-// Subscribe creates a consumer for the given topics using a shared
-// subscription name (groupID). The returned Receiver must be Start()ed by the
-// caller.
+// Subscribe creates a consumer for the given topics. The returned Receiver
+// must be Start()ed by the caller.
 func (e *ASBBrokerDriver) Subscribe(groupID string, topics []string, handler connectors.MessageHandler) (connectors.Receiver, error) {
 	return NewConsumer(e, groupID, topics, handler)
 }
 
-// SubscribeManual creates a consumer that settles on handler outcome for the
-// given topics.
+// SubscribeManual creates a consumer that settles on handler outcome.
 func (e *ASBBrokerDriver) SubscribeManual(groupID string, topics []string, handler connectors.MessageHandler) (connectors.Receiver, error) {
 	return NewManualCommitConsumer(e, groupID, topics, handler)
 }
 
-// Watch tails a topic from the current position and delivers all future
-// messages to handler until ctx is cancelled. consumerID is used as a stable
-// subscription-name suffix so the read position survives restarts, mirroring
-// the Kafka driver's consumer-group-per-consumerID approach.
+// Watch tails a topic from the current position until ctx is cancelled.
+// consumerID gives a stable subscription name so the read position survives
+// restarts, mirroring Kafka's consumer-group-per-consumerID approach.
 func (e *ASBBrokerDriver) Watch(ctx context.Context, consumerID string, topic string, handler connectors.MessageHandler) (connectors.Receiver, error) {
 	subscriptionName := syncSubscriptionName(consumerID)
 
-	if err := e.ensureSubscription(ctx, topic, subscriptionName); err != nil {
+	if err := e.ensureDisposableSubscription(ctx, topic, subscriptionName); err != nil {
 		return nil, fmt.Errorf("failed to ensure asb watch subscription %s on topic %s: %w", subscriptionName, topic, err)
 	}
 
@@ -326,30 +360,49 @@ func (e *ASBBrokerDriver) Watch(ctx context.Context, consumerID string, topic st
 	}
 
 	return &Consumer{
-		receiver: receiver,
-		topic:    topic,
-		handler:  handler,
-		mode:     settleAutoComplete,
+		receiver:   receiver,
+		topic:      topic,
+		handler:    handler,
+		mode:       settleAutoComplete,
+		disposable: true,
+		driver:     e,
+		groupID:    subscriptionName,
 	}, nil
 }
 
-// ensureSubscription idempotently creates an ASB subscription on topic.
-// HTTP 409 (already exists) is treated as success, matching EnsureTopics.
+// ensureSubscription idempotently creates a durable ASB subscription; 409 is
+// success. Durable subscriptions outlive idle periods and are removed only by
+// DeleteSubscription, because a quiet subscriber must not lose its backlog.
 func (e *ASBBrokerDriver) ensureSubscription(ctx context.Context, topic, subscriptionName string) error {
-	if _, err := e.admin.CreateSubscription(ctx, topic, subscriptionName, nil); err != nil && !isConflictErr(err) {
+	return e.createSubscription(ctx, topic, subscriptionName, nil)
+}
+
+// ensureDisposableSubscription creates a subscription Azure reclaims once idle.
+func (e *ASBBrokerDriver) ensureDisposableSubscription(ctx context.Context, topic, subscriptionName string) error {
+	if e.cfg.SubscriptionIdleTimeout <= 0 {
+		return e.createSubscription(ctx, topic, subscriptionName, nil)
+	}
+	return e.createSubscription(ctx, topic, subscriptionName, &admin.SubscriptionProperties{
+		AutoDeleteOnIdle: to.Ptr(iso8601Seconds(e.cfg.SubscriptionIdleTimeout)),
+	})
+}
+
+func (e *ASBBrokerDriver) createSubscription(ctx context.Context, topic, subscriptionName string, props *admin.SubscriptionProperties) error {
+	var opts *admin.CreateSubscriptionOptions
+	if props != nil {
+		opts = &admin.CreateSubscriptionOptions{Properties: props}
+	}
+	if _, err := e.admin.CreateSubscription(ctx, topic, subscriptionName, opts); err != nil && !isConflictErr(err) {
 		return err
 	}
 	return nil
 }
 
-// DeleteSubscription removes a subscriber's durable ASB Subscription on topic.
+// DeleteSubscription removes a subscriber's durable ASB Subscription.
 //
-// This is not part of connectors.BrokerDriver: Kafka has no equivalent entity
-// to delete, since a consumer group is implicit and broker-managed. The WebSub
-// ConsumerManager discovers this method through an optional-capability type
-// assertion, so drivers with nothing to clean up need no changes. An ASB
-// Subscription, by contrast, is a persistent entity that keeps accumulating
-// messages until explicitly removed.
+// Not part of connectors.BrokerDriver: Kafka consumer groups are implicit and
+// need no cleanup. ConsumerManager finds this via an optional-capability type
+// assertion, so other drivers need no changes.
 func (e *ASBBrokerDriver) DeleteSubscription(ctx context.Context, groupID string, topic string) error {
 	if _, err := e.admin.DeleteSubscription(ctx, topic, groupID, nil); err != nil {
 		if isNotFoundErr(err) {
@@ -360,17 +413,10 @@ func (e *ASBBrokerDriver) DeleteSubscription(ctx context.Context, groupID string
 	return nil
 }
 
-// subscriptionNameFor maps a broker-agnostic groupID onto a valid ASB
-// subscription name. Group IDs are sized for Kafka, which has no practical
-// consumer-group length limit, so some callers exceed ASB's 50 characters —
-// the per-connection WebSocket paths compose prefix + "-ws-" + a UUID, which
-// lands at 53. Rather than reject those (they are legitimate subscribers),
-// hash anything that doesn't fit.
-//
-// Short names pass through unchanged so the common case stays readable in the
-// Azure portal, and the mapping is deterministic either way: the same groupID
-// always resolves to the same subscription, which is what lets a durable
-// subscriber find its subscription again after a restart.
+// subscriptionNameFor maps a groupID onto a valid ASB subscription name. Group
+// IDs are sized for Kafka's unlimited names; the WebSocket paths compose one at
+// 53 characters, over ASB's 50. Short names pass through, longer ones hash —
+// deterministically, so a durable subscriber finds its subscription again.
 func subscriptionNameFor(groupID string) (string, error) {
 	if groupID == "" {
 		return "", fmt.Errorf("asb subscription name must not be empty")
@@ -381,23 +427,7 @@ func subscriptionNameFor(groupID string) (string, error) {
 	return "grp-" + shortHash(groupID), nil
 }
 
-// validateSubscriptionName reports whether a name derived internally by this
-// package is usable as-is. It fails closed rather than silently truncating —
-// a truncated name could collide with another subscriber's subscription on
-// the same topic, which is a correctness bug, not a cosmetic one.
-func validateSubscriptionName(name string) error {
-	if name == "" {
-		return fmt.Errorf("asb subscription name must not be empty")
-	}
-	if len(name) > maxSubscriptionNameLength {
-		return fmt.Errorf("asb subscription name %q is %d characters, exceeding the %d-character ASB limit", name, len(name), maxSubscriptionNameLength)
-	}
-	return nil
-}
-
-// receivedMessageToMessage converts a received ASB message into a
-// connectors.Message, reconstructing the tombstone/key/header encoding applied
-// by toServiceBusMessage.
+// receivedMessageToMessage reverses toServiceBusMessage's encoding.
 func receivedMessageToMessage(rm *azservicebus.ReceivedMessage, topic string) *connectors.Message {
 	msg := &connectors.Message{
 		Topic: topic,

@@ -2,6 +2,7 @@ package asb
 
 import (
 	"testing"
+	"time"
 
 	runtimeconfig "github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/config"
 )
@@ -64,5 +65,50 @@ func TestResolveConnectionConfig_RejectsNonStringOverride(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for non-string connection_string override")
+	}
+}
+
+func TestResolveConnectionConfig_CarriesSubscriptionIdleTimeout(t *testing.T) {
+	resolved, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{
+		ConnectionString:               validConnStr,
+		SubscriptionIdleTimeoutSeconds: 3600,
+	}, nil)
+	if err != nil {
+		t.Fatalf("ResolveConnectionConfig returned error: %v", err)
+	}
+	if resolved.SubscriptionIdleTimeout != time.Hour {
+		t.Fatalf("expected 1h idle timeout, got %s", resolved.SubscriptionIdleTimeout)
+	}
+}
+
+func TestResolveConnectionConfig_AllowsDisabledSubscriptionIdleTimeout(t *testing.T) {
+	resolved, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{ConnectionString: validConnStr}, nil)
+	if err != nil {
+		t.Fatalf("ResolveConnectionConfig returned error: %v", err)
+	}
+	if resolved.SubscriptionIdleTimeout != 0 {
+		t.Fatalf("expected reclamation to be disabled, got %s", resolved.SubscriptionIdleTimeout)
+	}
+}
+
+func TestResolveConnectionConfig_RejectsIdleTimeoutBelowAzureMinimum(t *testing.T) {
+	_, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{
+		ConnectionString:               validConnStr,
+		SubscriptionIdleTimeoutSeconds: 60,
+	}, nil)
+	if err == nil {
+		t.Fatal("expected error for an idle timeout below the five-minute ASB minimum")
+	}
+}
+
+func TestISO8601Seconds_RendersManagementAPIDuration(t *testing.T) {
+	for input, want := range map[time.Duration]string{
+		5 * time.Minute: "PT300S",
+		time.Hour:       "PT3600S",
+		24 * time.Hour:  "PT86400S",
+	} {
+		if got := iso8601Seconds(input); got != want {
+			t.Fatalf("iso8601Seconds(%s) = %q, want %q", input, got, want)
+		}
 	}
 }

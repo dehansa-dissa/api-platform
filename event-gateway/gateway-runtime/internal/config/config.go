@@ -99,6 +99,9 @@ type KafkaConfig struct {
 // ASBConfig holds Azure Service Bus connection settings.
 type ASBConfig struct {
 	ConnectionString string `koanf:"connection_string"`
+	// SubscriptionIdleTimeoutSeconds bounds how long Azure keeps one of the
+	// driver's disposable subscriptions alive with no activity.
+	SubscriptionIdleTimeoutSeconds int `koanf:"subscription_idle_timeout_seconds"`
 }
 
 // WebSubConfig holds WebSub-specific settings.
@@ -276,6 +279,9 @@ func DefaultConfig() *Config {
 		Kafka: KafkaConfig{
 			Brokers:             []string{"localhost:9092"},
 			ConsumerGroupPrefix: "event-gateway",
+		},
+		ASB: ASBConfig{
+			SubscriptionIdleTimeoutSeconds: 3600,
 		},
 		WebSub: WebSubConfig{
 			VerificationTimeoutSeconds: 10,
@@ -509,6 +515,14 @@ func validate(cfg *Config) error {
 // missing its connection string, rather than letting the driver fail lazily
 // on first use with a less specific error.
 func validateASBConfig(asbCfg ASBConfig) error {
+	// Azure rejects an AutoDeleteOnIdle below five minutes, so catch it here
+	// rather than on the first subscription create.
+	if asbCfg.SubscriptionIdleTimeoutSeconds < 0 {
+		return fmt.Errorf("asb.subscription_idle_timeout_seconds must not be negative")
+	}
+	if asbCfg.SubscriptionIdleTimeoutSeconds > 0 && asbCfg.SubscriptionIdleTimeoutSeconds < 300 {
+		return fmt.Errorf("asb.subscription_idle_timeout_seconds must be 0 (disabled) or at least 300, got %d", asbCfg.SubscriptionIdleTimeoutSeconds)
+	}
 	if strings.TrimSpace(asbCfg.ConnectionString) == "" {
 		return nil
 	}

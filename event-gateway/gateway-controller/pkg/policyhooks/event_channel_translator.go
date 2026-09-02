@@ -28,6 +28,7 @@ import (
 
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 
+	versionutil "github.com/wso2/api-platform/common/version"
 	api "github.com/wso2/api-platform/gateway/gateway-controller/pkg/api/management"
 	"github.com/wso2/api-platform/gateway/gateway-controller/pkg/config"
 	"github.com/wso2/api-platform/gateway/gateway-controller/pkg/models"
@@ -35,7 +36,6 @@ import (
 	"github.com/wso2/api-platform/gateway/gateway-controller/pkg/policyxds"
 	"github.com/wso2/api-platform/gateway/gateway-controller/pkg/utils"
 	"github.com/wso2/api-platform/gateway/gateway-controller/pkg/xds"
-	versionutil "github.com/wso2/api-platform/common/version"
 	policyv1alpha "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policyenginev1 "github.com/wso2/api-platform/sdk/core/policyengine"
 
@@ -189,11 +189,8 @@ func (t *EventChannelTranslator) buildEventChannelResourceForWebSub(uuid string,
 		}
 	}
 
-	// brokerDriver stays a zero-value/omitted-field map when spec.Broker is
-	// nil — resolveBrokerDriver on the runtime side (gateway-runtime/internal/
-	// xdsclient/handler.go) treats an empty Type as "kafka", so an existing
-	// WebSubApi with no broker configured keeps behaving exactly as before
-	// this field existed.
+	// Left empty when spec.Broker is nil: the runtime's resolveBrokerDriver
+	// treats an empty type as kafka, preserving pre-existing behaviour.
 	brokerDriver := map[string]interface{}{}
 	if spec.Broker != nil {
 		brokerDriver["type"] = spec.Broker.Type

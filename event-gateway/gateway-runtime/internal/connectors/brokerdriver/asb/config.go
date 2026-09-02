@@ -21,19 +21,28 @@ package asb
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/config"
 )
 
+// minSubscriptionIdleTimeout is the shortest AutoDeleteOnIdle Azure accepts.
+const minSubscriptionIdleTimeout = 5 * time.Minute
+
 // ConnectionConfig holds the Azure Service Bus connection settings used by the driver.
 type ConnectionConfig struct {
 	ConnectionString string
+	// SubscriptionIdleTimeout is applied as AutoDeleteOnIdle to the driver's
+	// disposable subscriptions. Global-only: it protects the namespace against
+	// orphans, so a per-binding override could not safely widen it.
+	SubscriptionIdleTimeout time.Duration
 }
 
 // ResolveConnectionConfig merges global runtime config with per-binding overrides.
 func ResolveConnectionConfig(global config.ASBConfig, overrides map[string]interface{}) (ConnectionConfig, error) {
 	cfg := ConnectionConfig{
-		ConnectionString: global.ConnectionString,
+		ConnectionString:        global.ConnectionString,
+		SubscriptionIdleTimeout: time.Duration(global.SubscriptionIdleTimeoutSeconds) * time.Second,
 	}
 
 	if overrides != nil {
@@ -55,11 +64,9 @@ func normalizeConnectionConfig(cfg *ConnectionConfig) {
 	cfg.ConnectionString = strings.TrimSpace(cfg.ConnectionString)
 }
 
-// validateConnectionConfig fails closed: an azureservicebus broker-driver binding
-// with no usable connection string must never be allowed to start (it would
-// otherwise fail lazily, and confusingly, on the first Publish/Subscribe call).
-// The connection string itself is never included in an error message — even a
-// malformed value can contain a live SharedAccessKey (see GO-AUTH-003).
+// validateConnectionConfig fails closed so a misconfigured binding is rejected
+// at startup rather than on first use. The connection string is never echoed
+// into an error: even a malformed value can carry a live SharedAccessKey.
 func validateConnectionConfig(cfg ConnectionConfig) error {
 	if cfg.ConnectionString == "" {
 		return fmt.Errorf("asb connection string must not be empty")
@@ -67,7 +74,19 @@ func validateConnectionConfig(cfg ConnectionConfig) error {
 	if !strings.HasPrefix(cfg.ConnectionString, "Endpoint=sb://") {
 		return fmt.Errorf("asb connection string is malformed: expected it to start with \"Endpoint=sb://\"")
 	}
+	if cfg.SubscriptionIdleTimeout < 0 {
+		return fmt.Errorf("asb subscription idle timeout must not be negative")
+	}
+	if cfg.SubscriptionIdleTimeout > 0 && cfg.SubscriptionIdleTimeout < minSubscriptionIdleTimeout {
+		return fmt.Errorf("asb subscription idle timeout must be 0 (disabled) or at least %s, got %s", minSubscriptionIdleTimeout, cfg.SubscriptionIdleTimeout)
+	}
 	return nil
+}
+
+// iso8601Seconds renders a duration in the ATOM-XML form the management API
+// expects for AutoDeleteOnIdle.
+func iso8601Seconds(d time.Duration) string {
+	return fmt.Sprintf("PT%dS", int64(d.Seconds()))
 }
 
 func stringOverride(value interface{}) (string, bool, error) {
