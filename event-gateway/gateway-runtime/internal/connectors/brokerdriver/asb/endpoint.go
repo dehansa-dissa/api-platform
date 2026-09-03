@@ -60,11 +60,9 @@ func NewClient(cfg ConnectionConfig) (*azservicebus.Client, error) {
 }
 
 // NewBrokerDriver creates an ASB broker-driver from the given connection config.
-//
-// runtimeID names this process's internal cache subscriptions (see replayer.go)
-// and must be stable across restarts — event-gateway generates a random one
-// when runtime_id is unset, which leaves an orphaned Subscription per compacted
-// topic on every restart.
+// runtimeID names this process's internal subscriptions (see replayer.go); it is
+// a fresh UUID per boot unless runtime_id is configured, so those subscriptions
+// carry AutoDeleteOnIdle to stop each restart stranding one per topic.
 func NewBrokerDriver(cfg ConnectionConfig, runtimeID string) (*ASBBrokerDriver, error) {
 	client, err := NewClient(cfg)
 	if err != nil {
@@ -155,9 +153,8 @@ func (e *ASBBrokerDriver) Close() error {
 }
 
 // releaseCacheSubscriptions drops this instance's cache subscriptions on a
-// graceful shutdown. AutoDeleteOnIdle would reclaim them eventually; doing it
-// here returns the quota immediately on a scale-down, which is the common case.
-// Best-effort: a failure here is a delayed reclaim, not a lost shutdown.
+// graceful shutdown, returning quota immediately rather than waiting out
+// AutoDeleteOnIdle. Best-effort: a failure is a delayed reclaim, not an error.
 func (e *ASBBrokerDriver) releaseCacheSubscriptions(topics []string) {
 	if len(topics) == 0 {
 		return
@@ -207,6 +204,14 @@ func (e *ASBBrokerDriver) deleteCompactionQueues(ctx context.Context, topic stri
 		}
 		slog.Info("Deleted compaction queue", "queue", queue)
 	}
+}
+
+// isLockLostErr reports that a message or session lock has already expired.
+// Distinct from a transport failure: the lock is provably gone rather than
+// merely unconfirmed, so a caller must concede instead of retrying.
+func isLockLostErr(err error) bool {
+	var sbErr *azservicebus.Error
+	return errors.As(err, &sbErr) && sbErr.Code == azservicebus.CodeLockLost
 }
 
 // isConflictErr reports an ASB "entity already exists" (HTTP 409) response.

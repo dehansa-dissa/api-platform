@@ -47,6 +47,8 @@ const (
 	compactionLockRenewBefore        = 20 * time.Second
 	compactionSnapshotDebounce       = time.Second
 	sessionRenewTimeout              = 5 * time.Second
+	sessionRenewMaxAttempts          = 2
+	sessionRenewRetryDelay           = time.Second
 	compactionElectionAttemptTimeout = 10 * time.Second
 	compactionElectionRetryBase      = 3 * time.Second
 	compactionElectionRetryJitterMax = 3 * time.Second
@@ -54,9 +56,7 @@ const (
 	snapshotPeekCount    = 10
 	snapshotDrainTimeout = 2 * time.Second
 
-	leaderSessionID = "leader"
-	// Fixed MessageID, deduplicated server-side by the lock queue's
-	// RequiresDuplicateDetection so repeated seeding never accumulates.
+	leaderSessionID     = "leader"
 	leaderSeedMessageID = "leader-election-seed"
 )
 
@@ -65,6 +65,8 @@ type leaderTimings struct {
 	snapshotInterval time.Duration
 	renewInterval    time.Duration
 	debounce         time.Duration
+	renewMaxAttempts int
+	renewRetryDelay  time.Duration
 }
 
 func defaultLeaderTimings() leaderTimings {
@@ -72,6 +74,8 @@ func defaultLeaderTimings() leaderTimings {
 		snapshotInterval: compactionSnapshotInterval,
 		renewInterval:    compactionLockRenewBefore,
 		debounce:         compactionSnapshotDebounce,
+		renewMaxAttempts: sessionRenewMaxAttempts,
+		renewRetryDelay:  sessionRenewRetryDelay,
 	}
 }
 
@@ -88,9 +92,21 @@ type compactedTopicState struct {
 	mu    sync.RWMutex
 	cache map[string][]byte // key -> latest value; tombstoned keys are absent
 
+	// version counts cache mutations; publishedVersion is the version the last
+	// successful snapshot write covered. A counter rather than a "dirty" bool:
+	// a change landing mid-publish would be cleared by that publish completing,
+	// whereas a counter leaves version ahead and the next tick still writes.
+	version          uint64
+	publishedVersion uint64
+
 	// dirty flags "cache changed since the last snapshot". Buffered to 1 and
 	// written non-blockingly, so many changes collapse into one signal.
 	dirty chan struct{}
+
+	// seeded records whether the cache was built from the existing snapshot.
+	// Set once before the goroutines start and never written again, so it needs
+	// no lock. An unseeded instance must never lead — see runLeaderElection.
+	seeded bool
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -141,7 +157,12 @@ func (e *ASBBrokerDriver) EnsureCompactedTopic(ctx context.Context, topic string
 	if err := e.replaySnapshotInto(ctx, snapshotQueue, func(key string, value []byte) {
 		state.cache[key] = value
 	}); err != nil {
-		slog.Warn("Failed to seed compacted-topic cache from existing snapshot; starting empty", "topic", topic, "error", err)
+		slog.Error("Failed to seed compacted-topic cache from the existing snapshot; "+
+			"this instance will not take leadership, so the snapshot is left intact. "+
+			"Restart once the namespace is reachable, or purge the snapshot queue if its contents are corrupt",
+			"topic", topic, "snapshot_queue", snapshotQueue, "error", err)
+	} else {
+		state.seeded = true
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -261,10 +282,9 @@ func (s *compactedTopicState) runLiveTail(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			// The cache subscription carries AutoDeleteOnIdle, so a quiet topic
-			// can have it reclaimed underneath us. Recreating alone would leave
-			// the cache missing anything published while it was gone, so the
-			// snapshot is replayed over it before tailing resumes.
+			// Reclaimed by AutoDeleteOnIdle on a quiet topic. Recreating alone
+			// would leave the cache missing whatever was published meanwhile,
+			// so rebuildCacheTail replays the snapshot over it.
 			if isNotFoundErr(err) {
 				if rebuilt, rebuildErr := s.rebuildCacheTail(ctx, receiver, subscriptionName); rebuildErr == nil {
 					slog.Info("Rebuilt reclaimed compacted-topic cache subscription", "topic", s.topic)
@@ -321,18 +341,15 @@ func (s *compactedTopicState) rebuildCacheTail(ctx context.Context, stale *azser
 		return nil, fmt.Errorf("failed to refill cache from snapshot: %w", err)
 	}
 
-	s.replaceCache(rebuilt)
+	// Swapped wholesale, never merged: a key tombstoned while the subscription
+	// was gone is absent from the snapshot, and merging would resurrect it.
+	s.mu.Lock()
+	s.cache = rebuilt
+	s.version++
+	s.mu.Unlock()
 
 	_ = stale.Close(context.Background())
 	return receiver, nil
-}
-
-// replaceCache swaps the whole cache rather than merging into it, so keys the
-// snapshot no longer carries are dropped.
-func (s *compactedTopicState) replaceCache(next map[string][]byte) {
-	s.mu.Lock()
-	s.cache = next
-	s.mu.Unlock()
 }
 
 func (s *compactedTopicState) applyToCache(msg *connectors.Message) {
@@ -343,9 +360,33 @@ func (s *compactedTopicState) applyToCache(msg *connectors.Message) {
 	} else {
 		s.cache[key] = msg.Value
 	}
+	s.version++
 	s.mu.Unlock()
 
 	s.markDirty()
+}
+
+// cacheVersion reads the current mutation count. Captured before a publish, so
+// a change landing during that publish is never mistaken for one it covered.
+func (s *compactedTopicState) cacheVersion() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.version
+}
+
+// markPublished records the version a successful snapshot write covered.
+func (s *compactedTopicState) markPublished(version uint64) {
+	s.mu.Lock()
+	s.publishedVersion = version
+	s.mu.Unlock()
+}
+
+// hasUnpublishedChanges reports whether the cache has moved on since the last
+// successful publish, including when that publish failed and left it behind.
+func (s *compactedTopicState) hasUnpublishedChanges() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.version != s.publishedVersion
 }
 
 // markDirty flags the cache as diverged from the last snapshot. Non-blocking:
@@ -388,7 +429,20 @@ func (s *compactedTopicState) snapshotCache() map[string][]byte {
 
 // runLeaderElection contends for the "leader" session and runs as leader while
 // it holds the lock.
+// runLeaderElection contends for the leader session until ctx is cancelled,
+// acting as leader for as long as it holds the lock.
+//
+// A cache that failed to seed is incomplete and can never become complete: the
+// live tail only carries changes published from now on, so state predating this
+// instance is unrecoverable without the snapshot. Leading with it would publish
+// that partial cache over the real snapshot and lose every subscriber missing
+// from it, so an unseeded instance stays a follower until restarted.
 func (s *compactedTopicState) runLeaderElection(ctx context.Context) {
+	if !s.seeded {
+		slog.Warn("Not contending for compacted-topic leadership: cache is unseeded", "topic", s.topic)
+		return
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -428,7 +482,13 @@ func (s *compactedTopicState) tryAcquireLeadership(ctx context.Context) (*azserv
 
 // seedLeaderSessionBestEffort creates the "leader" session by sending to it.
 // Duplicate detection on the queue collapses repeated seeding server-side.
+//
+// The sender must not stay in the publisher's cache: seeding runs only between
+// elections, and Azure force-detaches a link idle for 10 minutes, taking the
+// shared connection — and the leadership term — with it.
 func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
+	defer s.driver.publisher.closeSender(s.lockQueue)
+
 	sender, err := s.driver.publisher.senderFor(s.lockQueue)
 	if err != nil {
 		slog.Warn("Failed to open leader-lock seed sender", "topic", s.topic, "error", err)
@@ -475,10 +535,61 @@ func (s *compactedTopicState) runAsLeader(ctx context.Context, session *azservic
 	)
 }
 
+// renewWithRetry makes one extra attempt before conceding leadership. Kept
+// shallow: a dropped connection has already released the lock, so further
+// attempts only delay re-election. A lock-lost error skips the retry entirely.
+func (s *compactedTopicState) renewWithRetry(ctx context.Context, timings leaderTimings, renewLock func(context.Context) error) error {
+	attempts := timings.renewMaxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err = renewLock(ctx); err == nil {
+			if attempt > 1 {
+				slog.Info("Leader session lock renewed after retry", "topic", s.topic, "attempts", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if isLockLostErr(err) {
+			return fmt.Errorf("leader session lock lost: %w", err)
+		}
+		if attempt == attempts {
+			break
+		}
+
+		slog.Debug("Leader session lock renewal failed, retrying",
+			"topic", s.topic, "attempt", attempt, "error", err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(timings.renewRetryDelay):
+		}
+	}
+	return fmt.Errorf("leader session lock renewal failed after %d attempts: %w", attempts, err)
+}
+
 // runLeaderLoop keeps the session lock alive and decides when to snapshot,
 // returning when ctx is cancelled or the lock cannot be renewed. The dirty
 // signal is the primary trigger; the interval is a safety net. A failed write
-// is not fatal
+// is not fatal — the cache is still correct and the next trigger retries.
+// publishTracked publishes and, on success, records the version it covered.
+// The version is read before the write, so a change arriving mid-publish leaves
+// the cache ahead and the next tick still picks it up.
+func (s *compactedTopicState) publishTracked(ctx context.Context, publish func(context.Context) error) error {
+	version := s.cacheVersion()
+	if err := publish(ctx); err != nil {
+		return err
+	}
+	s.markPublished(version)
+	return nil
+}
+
 func (s *compactedTopicState) runLeaderLoop(
 	ctx context.Context,
 	timings leaderTimings,
@@ -495,7 +606,10 @@ func (s *compactedTopicState) runLeaderLoop(
 		case <-ctx.Done():
 			return
 		case <-renewTicker.C:
-			if err := renewLock(ctx); err != nil {
+			if err := s.renewWithRetry(ctx, timings, renewLock); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				slog.Warn("Failed to renew leader session lock, stepping down", "topic", s.topic, "error", err)
 				return
 			}
@@ -506,12 +620,18 @@ func (s *compactedTopicState) runLeaderLoop(
 			case <-time.After(timings.debounce):
 			}
 			s.drainDirty()
-			if err := publish(ctx); err != nil {
+			if err := s.publishTracked(ctx, publish); err != nil {
 				slog.Error("Failed to publish compacted-topic snapshot after change", "topic", s.topic, "error", err)
 			}
 		case <-snapshotTicker.C:
+			// The interval only covers a change the dirty path failed to write;
+			// republishing a snapshot that already matches the cache would cost
+			// a full write every tick for the lifetime of a quiet topic.
+			if !s.hasUnpublishedChanges() {
+				continue
+			}
 			s.drainDirty()
-			if err := publish(ctx); err != nil {
+			if err := s.publishTracked(ctx, publish); err != nil {
 				slog.Error("Failed to publish compacted-topic snapshot", "topic", s.topic, "error", err)
 			}
 		}

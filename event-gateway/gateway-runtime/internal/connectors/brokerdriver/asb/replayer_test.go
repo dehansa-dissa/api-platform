@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
@@ -120,24 +121,6 @@ func takeDirtySignal(s *compactedTopicState) bool {
 	}
 }
 
-func TestReplaceCache_DropsKeysMissingFromTheSnapshot(t *testing.T) {
-	s := newTestCompactedState()
-	s.applyToCache(&connectors.Message{Key: []byte("topic:kept"), Value: []byte("old")})
-	s.applyToCache(&connectors.Message{Key: []byte("topic:unsubscribed"), Value: []byte("stale")})
-
-	// What a rebuild after a reclaimed cache subscription installs: the
-	// snapshot as a whole, with the unsubscribed key no longer present.
-	s.replaceCache(map[string][]byte{"topic:kept": []byte("new")})
-
-	snapshot := s.snapshotCache()
-	if _, present := snapshot["topic:unsubscribed"]; present {
-		t.Fatal("a key absent from the snapshot must not survive a cache rebuild")
-	}
-	if got := string(snapshot["topic:kept"]); got != "new" {
-		t.Fatalf("expected the snapshot value to win, got %q", got)
-	}
-}
-
 func TestApplyToCache_UpsertMarksDirty(t *testing.T) {
 	s := newTestCompactedState()
 
@@ -234,7 +217,22 @@ func testLeaderTimings() leaderTimings {
 		snapshotInterval: 10 * time.Second,
 		renewInterval:    10 * time.Second,
 		debounce:         5 * time.Millisecond,
+		renewMaxAttempts: 2,
+		renewRetryDelay:  5 * time.Millisecond,
 	}
+}
+
+// failNTimes returns a renew func that fails with err its first n calls, then
+// succeeds, recording how many times it was called.
+func failNTimes(n int, err error) (func(context.Context) error, *int) {
+	calls := 0
+	return func(context.Context) error {
+		calls++
+		if calls <= n {
+			return err
+		}
+		return nil
+	}, &calls
 }
 
 type publishRecorder struct {
@@ -354,12 +352,80 @@ func TestLeaderLoop_CoalescesBurstIntoFewWrites(t *testing.T) {
 	}
 }
 
-func TestLeaderLoop_IntervalStillPublishesWithoutChanges(t *testing.T) {
+func TestRenewWithRetry_SucceedsWithoutRetryingWhenHealthy(t *testing.T) {
 	s := newTestCompactedState()
-	rec := newPublishRecorder()
+	renew, calls := failNTimes(0, nil)
+
+	if err := s.renewWithRetry(context.Background(), testLeaderTimings(), renew); err != nil {
+		t.Fatalf("renewWithRetry returned error: %v", err)
+	}
+	if *calls != 1 {
+		t.Fatalf("expected a healthy renewal to be attempted once, got %d attempts", *calls)
+	}
+}
+
+// The regression this whole change exists for: Azure force-detaches an idle
+// AMQP link every 10 minutes, so a renewal fails while the SDK rebuilds it.
+// Conceding on that single error surrendered leadership on a ~10-minute cycle.
+func TestRenewWithRetry_RidesOutTransientLinkFailure(t *testing.T) {
+	s := newTestCompactedState()
+	renew, calls := failNTimes(1, errors.New("context deadline exceeded"))
+
+	if err := s.renewWithRetry(context.Background(), testLeaderTimings(), renew); err != nil {
+		t.Fatalf("expected renewal to recover after a transient failure, got error: %v", err)
+	}
+	if *calls != 2 {
+		t.Fatalf("expected 2 attempts (one failure then success), got %d", *calls)
+	}
+}
+
+// Bounded deliberately: a dropped connection releases the session lock
+// server-side, so every further renewal is guaranteed to fail and each one
+// delays the re-election that actually restores a leader.
+func TestRenewWithRetry_ConcedesAfterTheAttemptLimit(t *testing.T) {
+	s := newTestCompactedState()
+	renew, calls := failNTimes(1<<30, errors.New("namespace unreachable"))
+
+	if err := s.renewWithRetry(context.Background(), testLeaderTimings(), renew); err == nil {
+		t.Fatal("expected renewWithRetry to concede once attempts are exhausted")
+	}
+	if *calls != 2 {
+		t.Fatalf("expected exactly 2 attempts, got %d", *calls)
+	}
+}
+
+// A lost lock is not a transport failure: the session is provably gone and
+// another instance may already hold it, so retrying risks two leaders.
+func TestRenewWithRetry_ConcedesImmediatelyWhenLockIsLost(t *testing.T) {
+	s := newTestCompactedState()
+	renew, calls := failNTimes(1<<30, &azservicebus.Error{Code: azservicebus.CodeLockLost})
+
+	if err := s.renewWithRetry(context.Background(), testLeaderTimings(), renew); err == nil {
+		t.Fatal("expected a lost lock to end the leadership term")
+	}
+	if *calls != 1 {
+		t.Fatalf("expected a lost lock to concede without retrying, got %d attempts", *calls)
+	}
+}
+
+func TestRenewWithRetry_StopsOnContextCancel(t *testing.T) {
+	s := newTestCompactedState()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	renew, _ := failNTimes(1<<30, errors.New("namespace unreachable"))
+	if err := s.renewWithRetry(ctx, testLeaderTimings(), renew); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestLeaderLoop_KeepsLeadershipThroughTransientRenewalFailure(t *testing.T) {
+	s := newTestCompactedState()
 
 	timings := testLeaderTimings()
-	timings.snapshotInterval = 20 * time.Millisecond
+	timings.renewInterval = 10 * time.Millisecond
+
+	renew, _ := failNTimes(1, errors.New("context deadline exceeded"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -367,13 +433,13 @@ func TestLeaderLoop_IntervalStillPublishesWithoutChanges(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+		s.runLeaderLoop(ctx, timings, renew, neverFails)
 	}()
 
 	select {
-	case <-rec.first:
-	case <-time.After(2 * time.Second):
-		t.Fatal("interval safety net did not fire with no cache changes")
+	case <-done:
+		t.Fatal("loop surrendered leadership on a transient renewal failure that recovered")
+	case <-time.After(200 * time.Millisecond):
 	}
 
 	cancel()
@@ -406,6 +472,12 @@ func TestLeaderLoop_SurvivesPublishFailure(t *testing.T) {
 	s := newTestCompactedState()
 	rec := newPublishRecorder()
 	rec.err = errors.New("transient azure failure")
+
+	// A pending change is what the interval exists to rescue. Draining the
+	// dirty signal leaves only the interval path able to fire, so the retries
+	// counted below are the interval's, not the change trigger's.
+	s.applyToCache(&connectors.Message{Key: []byte("k"), Value: []byte("v")})
+	s.drainDirty()
 
 	timings := testLeaderTimings()
 	timings.snapshotInterval = 15 * time.Millisecond
@@ -485,5 +557,77 @@ func TestLeaderLoop_ReturnsWhenCancelledDuringDebounce(t *testing.T) {
 
 	if rec.count() != 0 {
 		t.Fatal("expected no snapshot write after cancellation during debounce")
+	}
+}
+
+// An unseeded cache is incomplete and cannot recover: the live tail only
+// carries changes from now on. Leading with it would publish that partial cache
+// over the real snapshot. The state here has a nil driver, so reaching the
+// acquisition path at all would panic — proving the guard returns first.
+func TestRunLeaderElection_RefusesLeadershipWhenCacheIsUnseeded(t *testing.T) {
+	s := newTestCompactedState()
+	if s.seeded {
+		t.Fatal("test premise broken: expected a fresh state to be unseeded")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runLeaderElection(context.Background())
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unseeded instance contended for leadership; it would overwrite the snapshot with a partial cache")
+	}
+}
+
+func TestLeaderLoop_SkipsIntervalPublishWhenNothingChanged(t *testing.T) {
+	s := newTestCompactedState()
+	rec := newPublishRecorder()
+
+	timings := testLeaderTimings()
+	timings.snapshotInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+	}()
+
+	time.Sleep(150 * time.Millisecond) // ~15 ticks
+	cancel()
+	<-done
+
+	if got := rec.count(); got != 0 {
+		t.Fatalf("expected no writes on a quiet topic, got %d — an idle leader would rewrite the whole snapshot every tick", got)
+	}
+}
+
+func TestLeaderLoop_IntervalPublishesOnceThenStops(t *testing.T) {
+	s := newTestCompactedState()
+	rec := newPublishRecorder()
+
+	s.applyToCache(&connectors.Message{Key: []byte("k"), Value: []byte("v")})
+	s.drainDirty()
+
+	timings := testLeaderTimings()
+	timings.snapshotInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+	}()
+
+	time.Sleep(150 * time.Millisecond) // ~15 ticks, one pending change
+	cancel()
+	<-done
+
+	if got := rec.count(); got != 1 {
+		t.Fatalf("expected the pending change to be written exactly once, got %d", got)
 	}
 }

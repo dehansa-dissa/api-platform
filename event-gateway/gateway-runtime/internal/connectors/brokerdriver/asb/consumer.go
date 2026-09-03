@@ -64,9 +64,8 @@ func sleepBackoff(ctx context.Context, attempt int) bool {
 }
 
 // settleMode mirrors the two Kafka consumer variants. Handler failure never
-// abandons the message: that would have ASB re-drive the handler, duplicating
-// the Deliverer's retry-with-backoff, which by then is exhausted. A lock
-// expiring from a crash still redelivers — crash recovery, not retry.
+// abandons the message — the Deliverer owns retry, and abandoning would compound
+// two retry systems. A crash still redelivers via lock expiry.
 type settleMode int
 
 const (
@@ -158,10 +157,8 @@ func (c *Consumer) consumeLoop(ctx context.Context) {
 }
 
 // reopen recreates a subscription that vanished underneath the receiver and
-// rebuilds the receiver on it. AutoDeleteOnIdle makes this reachable for the
-// driver's disposable subscriptions; an operator deleting one by hand reaches
-// it for any of them, where the alternative is a consumer that fails silently
-// until the process restarts.
+// rebuilds the receiver on it. Reachable via AutoDeleteOnIdle reclaiming a
+// disposable subscription, or an operator deleting any of them by hand.
 func (c *Consumer) reopen(ctx context.Context) error {
 	if c.driver == nil || c.groupID == "" {
 		return fmt.Errorf("consumer is not bound to a driver")
@@ -398,11 +395,9 @@ func (e *ASBBrokerDriver) createSubscription(ctx context.Context, topic, subscri
 	return nil
 }
 
-// DeleteSubscription removes a subscriber's durable ASB Subscription.
-//
-// Not part of connectors.BrokerDriver: Kafka consumer groups are implicit and
-// need no cleanup. ConsumerManager finds this via an optional-capability type
-// assertion, so other drivers need no changes.
+// DeleteSubscription removes a subscriber's durable ASB Subscription. Kept off
+// connectors.BrokerDriver — Kafka consumer groups need no cleanup — and found by
+// ConsumerManager through an optional-capability type assertion.
 func (e *ASBBrokerDriver) DeleteSubscription(ctx context.Context, groupID string, topic string) error {
 	if _, err := e.admin.DeleteSubscription(ctx, topic, groupID, nil); err != nil {
 		if isNotFoundErr(err) {

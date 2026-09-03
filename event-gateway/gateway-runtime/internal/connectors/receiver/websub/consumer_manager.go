@@ -162,7 +162,7 @@ func (cm *ConsumerManager) RemoveSubscription(callbackURL, kafkaTopic string) er
 
 	// Drivers without a durable per-subscriber entity (Kafka) skip this.
 	if deleter, ok := cm.brokerDriver.(subscriptionDeleter); ok {
-		deleteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		deleteCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := deleter.DeleteSubscription(deleteCtx, groupID, kafkaTopic); err != nil {
 			slog.Error("Failed to delete broker subscription on unsubscribe", "callback", callbackURL, "topic", kafkaTopic, "error", err)
 		}
