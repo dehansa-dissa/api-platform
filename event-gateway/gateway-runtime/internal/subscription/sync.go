@@ -93,11 +93,14 @@ func (p *SyncProducer) PublishTombstone(_ context.Context, topic, callbackURL st
 	return nil
 }
 
-// ExistsInKafka checks whether an active subscription for the given topic and
-// callbackURL exists in the Kafka sync topic. It replays the compacted topic and
-// returns true only if the latest record for that key is a non-tombstone value.
-// Used to validate cross-instance unsubscribe requests.
-func (p *SyncProducer) ExistsInKafka(ctx context.Context, topic, callbackURL string) (bool, error) {
+// ExistsInBroker reports whether an active subscription for the given topic and
+// callbackURL is recorded in the sync topic, via the driver's own Replay — the
+// compacted log on Kafka, the snapshot queue on ASB. True only when the latest
+// record for that key is a non-tombstone value.
+//
+// Used to validate an unsubscribe that lands on an instance which never handled
+// the original subscribe, and so has nothing about it in memory.
+func (p *SyncProducer) ExistsInBroker(ctx context.Context, topic, callbackURL string) (bool, error) {
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
@@ -113,7 +116,7 @@ func (p *SyncProducer) ExistsInKafka(ctx context.Context, topic, callbackURL str
 		return nil
 	})
 	if err != nil {
-		return false, fmt.Errorf("failed to check subscription in Kafka: %w", err)
+		return false, fmt.Errorf("failed to check subscription in the broker: %w", err)
 	}
 	return found, nil
 }

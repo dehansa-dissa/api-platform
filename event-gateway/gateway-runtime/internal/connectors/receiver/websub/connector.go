@@ -163,7 +163,7 @@ func (e *WebSubReceiver) Start(ctx context.Context) error {
 
 	if len(topicsToEnsure) > 0 {
 		if err := e.brokerDriver.EnsureTopics(ctx, topicsToEnsure, topicMetadata); err != nil {
-			return fmt.Errorf("failed to ensure kafka topics: %w", err)
+			return fmt.Errorf("failed to ensure broker topics: %w", err)
 		}
 	}
 

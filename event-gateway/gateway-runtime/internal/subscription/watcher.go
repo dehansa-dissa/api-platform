@@ -73,10 +73,14 @@ func (w *SyncWatcher) Watch(ctx context.Context) (connectors.Receiver, error) {
 	if err := receiver.Start(ctx); err != nil {
 		return nil, err
 	}
+	// consumerID, not a composed group name: each driver derives its own
+	// subscriber name from this, and ASB hashes it to fit a 50-character
+	// limit. Printing a name we composed here sends operators looking for an
+	// entity the broker never created.
 	slog.Info("Subscription sync watcher started",
 		"topic", w.syncTopic,
 		"runtime_id", w.runtimeID,
-		"sync_group", "event-gateway-sync-"+consumerID)
+		"consumer_id", consumerID)
 	return receiver, nil
 }
 

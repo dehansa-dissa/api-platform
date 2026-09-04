@@ -99,17 +99,17 @@ func (e *WebBrokerApiReceiver) Start(ctx context.Context) error {
 
 	// Ensure all topics exist in Kafka.
 	if len(e.opts.Topics) > 0 {
-		slog.Info("Ensuring Kafka topics exist",
+		slog.Info("Ensuring broker topics exist",
 			"channel", e.channel.Name,
 			"topics", e.opts.Topics)
 		if err := e.brokerDriver.EnsureTopics(ctx, e.opts.Topics, nil); err != nil {
-			return fmt.Errorf("failed to ensure kafka topics: %w", err)
+			return fmt.Errorf("failed to ensure broker topics: %w", err)
 		}
-		slog.Info("Kafka topics verified",
+		slog.Info("Broker topics verified",
 			"channel", e.channel.Name,
 			"topics", e.opts.Topics)
 	} else {
-		slog.Warn("No Kafka topics configured for WebBrokerApi",
+		slog.Warn("No broker topics configured for WebBrokerApi",
 			"channel", e.channel.Name)
 	}
 
@@ -456,7 +456,7 @@ func (e *WebBrokerApiReceiver) inboundLoop(ctx context.Context, conn *brokerApiC
 			}
 
 			// Publish to Kafka.
-			slog.Debug("[6] Publishing message to Kafka",
+			slog.Debug("[6] Publishing message to broker",
 				"connID", conn.connID,
 				"api", e.channel.Name,
 				"channel", conn.channelName,
@@ -464,9 +464,9 @@ func (e *WebBrokerApiReceiver) inboundLoop(ctx context.Context, conn *brokerApiC
 				"message_size", len(processed.Value))
 
 			if err := e.brokerDriver.Publish(ctx, targetTopic, processed); err != nil {
-				slog.Error("[6] Failed to publish to Kafka", "connID", conn.connID, "topic", targetTopic, "error", err)
+				slog.Error("[6] Failed to publish to broker", "connID", conn.connID, "topic", targetTopic, "error", err)
 			} else {
-				slog.Debug("[6] Message successfully published to Kafka", "connID", conn.connID, "topic", targetTopic)
+				slog.Debug("[6] Message successfully published to broker", "connID", conn.connID, "topic", targetTopic)
 			}
 		}
 	}

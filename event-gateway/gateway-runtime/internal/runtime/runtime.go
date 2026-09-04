@@ -289,7 +289,7 @@ func (r *Runtime) LoadChannels(channelsPath string) error {
 			"context", wsb.Context,
 			"version", wsb.Version,
 			"channels", len(wsb.Channels),
-			"kafka_topics", allKafkaTopics,
+			"topics", allKafkaTopics,
 		)
 	}
 
@@ -1191,7 +1191,7 @@ func (r *Runtime) RemoveWebSubApiBinding(name string) error {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if err := bd.DeleteTopics(ctx, topics); err != nil {
-				slog.Error("Failed to delete Kafka topics during removal", "name", name, "error", err)
+				slog.Error("Failed to delete broker topics during removal", "name", name, "error", err)
 			}
 		}
 		delete(r.bindingTopics, name)

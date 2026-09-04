@@ -261,9 +261,9 @@ func (h *HubHandler) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "subscription not found", http.StatusNotFound)
 			return
 		}
-		exists, lookupErr := h.syncProducer.ExistsInKafka(r.Context(), topic, callback)
+		exists, lookupErr := h.syncProducer.ExistsInBroker(r.Context(), topic, callback)
 		if lookupErr != nil {
-			slog.Error("Failed to look up subscription in Kafka", "error", lookupErr)
+			slog.Error("Failed to look up subscription in the broker", "error", lookupErr)
 			http.Error(w, "failed to verify subscription", http.StatusInternalServerError)
 			return
 		}
