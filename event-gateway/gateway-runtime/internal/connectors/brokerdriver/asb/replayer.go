@@ -55,6 +55,7 @@ const (
 
 	snapshotPeekCount    = 10
 	snapshotDrainTimeout = 2 * time.Second
+	shutdownFlushTimeout = 10 * time.Second
 
 	leaderSessionID     = "leader"
 	leaderSeedMessageID = "leader-election-seed"
@@ -578,6 +579,25 @@ func (s *compactedTopicState) renewWithRetry(ctx context.Context, timings leader
 // returning when ctx is cancelled or the lock cannot be renewed. The dirty
 // signal is the primary trigger; the interval is a safety net. A failed write
 // is not fatal — the cache is still correct and the next trigger retries.
+
+// flushPendingSnapshot writes one final snapshot as the leader steps down for
+// shutdown, on a fresh context because shutdown has already cancelled the loop's
+// own.
+func (s *compactedTopicState) flushPendingSnapshot(publish func(context.Context) error) {
+	if !s.hasUnpublishedChanges() {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
+	defer cancel()
+
+	if err := s.publishTracked(ctx, publish); err != nil {
+		slog.Error("Failed to flush pending compacted-topic snapshot on shutdown", "topic", s.topic, "error", err)
+		return
+	}
+	slog.Info("Flushed pending compacted-topic snapshot on shutdown", "topic", s.topic)
+}
+
 // publishTracked publishes and, on success, records the version it covered.
 // The version is read before the write, so a change arriving mid-publish leaves
 // the cache ahead and the next tick still picks it up.
@@ -604,18 +624,23 @@ func (s *compactedTopicState) runLeaderLoop(
 	for {
 		select {
 		case <-ctx.Done():
+			s.flushPendingSnapshot(publish)
 			return
 		case <-renewTicker.C:
 			if err := s.renewWithRetry(ctx, timings, renewLock); err != nil {
 				if ctx.Err() != nil {
+					s.flushPendingSnapshot(publish)
 					return
 				}
+				// No flush: the lock is gone, so another instance may already
+				// be the writer.
 				slog.Warn("Failed to renew leader session lock, stepping down", "topic", s.topic, "error", err)
 				return
 			}
 		case <-s.dirty:
 			select {
 			case <-ctx.Done():
+				s.flushPendingSnapshot(publish)
 				return
 			case <-time.After(timings.debounce):
 			}

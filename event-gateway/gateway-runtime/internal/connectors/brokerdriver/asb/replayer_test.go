@@ -555,15 +555,11 @@ func TestLeaderLoop_ReturnsWhenCancelledDuringDebounce(t *testing.T) {
 		t.Fatal("loop blocked in the debounce window instead of honouring cancellation")
 	}
 
-	if rec.count() != 0 {
-		t.Fatal("expected no snapshot write after cancellation during debounce")
+	if got := rec.count(); got != 1 {
+		t.Fatalf("expected the debounced change to be flushed on shutdown, got %d writes", got)
 	}
 }
 
-// An unseeded cache is incomplete and cannot recover: the live tail only
-// carries changes from now on. Leading with it would publish that partial cache
-// over the real snapshot. The state here has a nil driver, so reaching the
-// acquisition path at all would panic — proving the guard returns first.
 func TestRunLeaderElection_RefusesLeadershipWhenCacheIsUnseeded(t *testing.T) {
 	s := newTestCompactedState()
 	if s.seeded {
@@ -629,5 +625,28 @@ func TestLeaderLoop_IntervalPublishesOnceThenStops(t *testing.T) {
 
 	if got := rec.count(); got != 1 {
 		t.Fatalf("expected the pending change to be written exactly once, got %d", got)
+	}
+}
+
+func TestLeaderLoop_ShutdownFlushSkippedWhenNothingPending(t *testing.T) {
+	s := newTestCompactedState()
+	rec := newPublishRecorder()
+
+	timings := testLeaderTimings()
+	timings.snapshotInterval = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+
+	if got := rec.count(); got != 0 {
+		t.Fatalf("expected no shutdown write with nothing pending, got %d", got)
 	}
 }
