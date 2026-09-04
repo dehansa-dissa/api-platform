@@ -389,9 +389,52 @@ func (e *ASBBrokerDriver) createSubscription(ctx context.Context, topic, subscri
 	if props != nil {
 		opts = &admin.CreateSubscriptionOptions{Properties: props}
 	}
-	if _, err := e.admin.CreateSubscription(ctx, topic, subscriptionName, opts); err != nil && !isConflictErr(err) {
+	_, err := e.admin.CreateSubscription(ctx, topic, subscriptionName, opts)
+	if err == nil {
+		return nil
+	}
+	if !isConflictErr(err) {
 		return err
 	}
+	if props == nil {
+		return nil
+	}
+	if err := e.reconcileIdleTimeout(ctx, topic, subscriptionName, props); err != nil {
+		// Not fatal: the subscription exists and is usable, only its reclaim
+		// window is stale, and an early reclaim is already self-healed on 404.
+		slog.Warn("Failed to update asb subscription idle timeout",
+			"topic", topic, "subscription", subscriptionName, "error", err)
+	}
+	return nil
+}
+
+// reconcileIdleTimeout applies a changed AutoDeleteOnIdle to a subscription that
+// already exists. Create answers 409 without touching the entity, so without
+// this a subscription keeps the timeout it was born with and a raised
+// subscription_idle_timeout_seconds never reaches the subscriptions already out
+// there — only ones created afterwards.
+func (e *ASBBrokerDriver) reconcileIdleTimeout(ctx context.Context, topic, subscriptionName string, desired *admin.SubscriptionProperties) error {
+	if desired.AutoDeleteOnIdle == nil {
+		return nil
+	}
+	existing, err := e.admin.GetSubscription(ctx, topic, subscriptionName, nil)
+	if err != nil {
+		return err
+	}
+	if existing.AutoDeleteOnIdle != nil && *existing.AutoDeleteOnIdle == *desired.AutoDeleteOnIdle {
+		return nil
+	}
+
+	// Update replaces the whole entity, so send back what Get returned with only
+	// the idle timeout swapped — passing desired alone would reset every other
+	// property to an SDK default.
+	updated := existing.SubscriptionProperties
+	updated.AutoDeleteOnIdle = desired.AutoDeleteOnIdle
+	if _, err := e.admin.UpdateSubscription(ctx, topic, subscriptionName, updated, nil); err != nil {
+		return err
+	}
+	slog.Info("Updated asb subscription idle timeout",
+		"topic", topic, "subscription", subscriptionName, "idle_timeout", *desired.AutoDeleteOnIdle)
 	return nil
 }
 
