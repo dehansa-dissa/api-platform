@@ -31,6 +31,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/admin"
+	"github.com/Azure/go-amqp"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
@@ -220,14 +221,24 @@ func isConflictErr(err error) bool {
 	return errors.As(err, &respErr) && respErr.StatusCode == http.StatusConflict
 }
 
-// isNotFoundErr reports an ASB "entity not found" (HTTP 404) response.
+// isNotFoundErr reports "entity does not exist" in all three shapes the SDK
+// delivers it in. The management API answers HTTP 404, and an RPC-path failure
+// is wrapped as CodeNotFound — but a receiver link detaching because its
+// subscription was deleted is neither: TransformError classifies amqp:not-found
+// as RecoveryKindFatal and returns the raw *amqp.Error unwrapped. The receive
+// loops self-heal off this function, so without the third shape they back off
+// forever against a subscription that is never coming back.
 func isNotFoundErr(err error) bool {
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
 		return true
 	}
 	var sbErr *azservicebus.Error
-	return errors.As(err, &sbErr) && sbErr.Code == azservicebus.CodeNotFound
+	if errors.As(err, &sbErr) && sbErr.Code == azservicebus.CodeNotFound {
+		return true
+	}
+	var amqpErr *amqp.Error
+	return errors.As(err, &amqpErr) && amqpErr.Condition == amqp.ErrCondNotFound
 }
 
 // isSBTimeoutErr reports CodeTimeout, returned both when no session is

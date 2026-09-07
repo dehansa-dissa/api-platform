@@ -11,6 +11,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
+	"github.com/Azure/go-amqp"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
@@ -204,17 +205,24 @@ func TestSubscriptionNameFor_RejectsEmpty(t *testing.T) {
 	}
 }
 
-func TestIsNotFoundErr_MatchesManagementAndAMQPForms(t *testing.T) {
+func TestIsNotFoundErr_MatchesAllThreeNotFoundForms(t *testing.T) {
+	linkDetached := &amqp.Error{
+		Condition:   amqp.ErrCondNotFound,
+		Description: "The messaging entity 'ns:Topic:abc|cache-def' could not be found.",
+	}
+
 	cases := map[string]struct {
 		err  error
 		want bool
 	}{
-		"management 404":  {&azcore.ResponseError{StatusCode: http.StatusNotFound}, true},
-		"amqp notfound":   {&azservicebus.Error{Code: azservicebus.CodeNotFound}, true},
-		"wrapped amqp":    {fmt.Errorf("receive: %w", &azservicebus.Error{Code: azservicebus.CodeNotFound}), true},
-		"management 409":  {&azcore.ResponseError{StatusCode: http.StatusConflict}, false},
-		"amqp conn lost":  {&azservicebus.Error{Code: azservicebus.CodeConnectionLost}, false},
-		"unrelated error": {errors.New("boom"), false},
+		"management 404":       {&azcore.ResponseError{StatusCode: http.StatusNotFound}, true},
+		"rpc path notfound":    {&azservicebus.Error{Code: azservicebus.CodeNotFound}, true},
+		"detached link":        {linkDetached, true},
+		"wrapped detached":     {fmt.Errorf("receive: %w", linkDetached), true},
+		"management 409":       {&azcore.ResponseError{StatusCode: http.StatusConflict}, false},
+		"connection lost":      {&azservicebus.Error{Code: azservicebus.CodeConnectionLost}, false},
+		"other amqp condition": {&amqp.Error{Condition: amqp.ErrCondUnauthorizedAccess}, false},
+		"unrelated error":      {errors.New("boom"), false},
 	}
 
 	for name, tc := range cases {
