@@ -610,6 +610,20 @@ func (s *compactedTopicState) publishTracked(ctx context.Context, publish func(c
 	return nil
 }
 
+// publishAndReport writes a snapshot and reports a failure at the level it deserves.
+func (s *compactedTopicState) publishAndReport(ctx context.Context, publish func(context.Context) error, failureMsg string) {
+	err := s.publishTracked(ctx, publish)
+	if err == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		slog.Debug("Compacted-topic snapshot write cancelled during teardown",
+			"topic", s.topic, "error", err)
+		return
+	}
+	slog.Error(failureMsg, "topic", s.topic, "error", err)
+}
+
 func (s *compactedTopicState) runLeaderLoop(
 	ctx context.Context,
 	timings leaderTimings,
@@ -645,9 +659,7 @@ func (s *compactedTopicState) runLeaderLoop(
 			case <-time.After(timings.debounce):
 			}
 			s.drainDirty()
-			if err := s.publishTracked(ctx, publish); err != nil {
-				slog.Error("Failed to publish compacted-topic snapshot after change", "topic", s.topic, "error", err)
-			}
+			s.publishAndReport(ctx, publish, "Failed to publish compacted-topic snapshot after change")
 		case <-snapshotTicker.C:
 			// The interval only covers a change the dirty path failed to write;
 			// republishing a snapshot that already matches the cache would cost
@@ -656,9 +668,7 @@ func (s *compactedTopicState) runLeaderLoop(
 				continue
 			}
 			s.drainDirty()
-			if err := s.publishTracked(ctx, publish); err != nil {
-				slog.Error("Failed to publish compacted-topic snapshot", "topic", s.topic, "error", err)
-			}
+			s.publishAndReport(ctx, publish, "Failed to publish compacted-topic snapshot")
 		}
 	}
 }
