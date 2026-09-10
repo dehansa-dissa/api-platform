@@ -29,6 +29,7 @@ help: ## Show available targets
 	@echo '  make test                  Run the full integration test suite (SQLite)'
 	@echo '  make test-postgres         Run the full integration test suite with PostgreSQL'
 	@echo '  make test-sqlserver        Run the full integration test suite with SQL Server'
+	@echo '  make test-asb              Run the Azure Service Bus feature (needs a namespace)'
 	@echo '  make test-health           Run only health-check scenarios'
 	@echo '  make test-websub           Run only WebSub management scenarios'
 	@echo '  make test-e2e              Run only end-to-end WebSub flow scenarios'
@@ -48,6 +49,23 @@ test-postgres: ## Run integration tests with PostgreSQL backend
 .PHONY: test-sqlserver
 test-sqlserver: ## Run integration tests with SQL Server backend
 	IT_COMPOSE_FILE=../docker-compose.test.sqlserver.yaml go test -v -timeout 10m ./...
+
+# Unlike every other target this one needs a reachable Azure Service Bus
+# namespace: Service Bus has no container image, so it cannot be started as
+# part of the stack. Requires APIP_EGW_ASB_CONNECTION_STRING, on a policy with
+# Manage rights. The timeout is longer than the Kafka equivalents because every
+# entity operation is a cloud round trip.
+#
+# -count=1 defeats Go's test cache. Everything this suite actually exercises —
+# the gateway image, the containers, the namespace — is invisible to that cache,
+# so a rebuilt image or a changed driver would otherwise replay a stale pass.
+.PHONY: test-asb
+test-asb: ## Run Azure Service Bus end-to-end feature (needs APIP_EGW_ASB_CONNECTION_STRING)
+	@test -n "$$APIP_EGW_ASB_CONNECTION_STRING" || \
+		{ echo "APIP_EGW_ASB_CONNECTION_STRING is not set — see docker-compose.test.asb.yaml"; exit 1; }
+	IT_COMPOSE_FILE=../docker-compose.test.asb.yaml \
+	IT_FEATURE_PATHS=asb-e2e.feature \
+	go test -v -count=1 -timeout 15m ./...
 
 .PHONY: test-health
 test-health: ## Run health check feature only
