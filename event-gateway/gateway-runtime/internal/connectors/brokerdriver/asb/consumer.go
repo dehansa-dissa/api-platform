@@ -421,6 +421,10 @@ func (e *ASBBrokerDriver) reconcileIdleTimeout(ctx context.Context, topic, subsc
 	if err != nil {
 		return err
 	}
+
+	if existing == nil {
+		return nil
+	}
 	if existing.AutoDeleteOnIdle != nil && *existing.AutoDeleteOnIdle == *desired.AutoDeleteOnIdle {
 		return nil
 	}

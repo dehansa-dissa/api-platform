@@ -93,14 +93,14 @@ func (e *ASBBrokerDriver) Publish(ctx context.Context, topic string, msg *connec
 
 // TopicExists checks whether a topic exists in the ASB namespace.
 func (e *ASBBrokerDriver) TopicExists(ctx context.Context, topic string) (bool, error) {
-	_, err := e.admin.GetTopic(ctx, topic, nil)
-	if err == nil {
-		return true, nil
+	resp, err := e.admin.GetTopic(ctx, topic, nil)
+	if err != nil {
+		if isNotFoundErr(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to check topic %s: %w", topic, err)
 	}
-	if isNotFoundErr(err) {
-		return false, nil
-	}
-	return false, fmt.Errorf("failed to check topic %s: %w", topic, err)
+	return resp != nil, nil
 }
 
 // EnsureTopics creates topics if they don't already exist (idempotent).
