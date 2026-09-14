@@ -153,4 +153,5 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	RegisterWebBrokerSteps(ctx, testState)
 	RegisterCommonSteps(ctx, testState)
 	RegisterWebhookSecretSteps(ctx, testState, whSecretSteps)
+	RegisterASBSteps(ctx, composeManager)
 }

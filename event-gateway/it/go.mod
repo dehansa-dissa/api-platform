@@ -21,6 +21,7 @@ module github.com/wso2/api-platform/event-gateway/it
 go 1.26.10
 
 require (
+	github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus v1.10.0
 	github.com/cucumber/godog v0.16.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/testcontainers/testcontainers-go/modules/compose v0.44.0
@@ -29,6 +30,9 @@ require (
 
 require (
 	dario.cat/mergo v1.0.2 // indirect
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.20.0 // indirect
+	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
+	github.com/Azure/go-amqp v1.4.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/DefangLabs/secret-detector v0.0.0-20260916192156-3e28d7ed64df // indirect
 	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 // indirect

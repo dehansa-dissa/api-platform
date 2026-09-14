@@ -44,6 +44,11 @@ const (
 
 	// HealthCheckInterval is how often to poll service health endpoints.
 	HealthCheckInterval = 2 * time.Second
+
+	// ServiceStopTimeout bounds how long a service gets to exit on its own
+	// before Docker kills it. Long enough to stay graceful: a broker driver may
+	// have shutdown work to finish, and a kill would skip it.
+	ServiceStopTimeout = 30 * time.Second
 )
 
 // ComposeManager manages the Docker Compose lifecycle for integration tests.
@@ -174,6 +179,37 @@ func (cm *ComposeManager) WaitForHealthy(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// RestartService stops one compose service and starts it again, returning once
+// the stack reports healthy. The container keeps its volumes and network, so
+// only the process is replaced.
+//
+// The stop is graceful on purpose. A killed gateway skips its shutdown work,
+// and for the ASB driver that work is the point: the final snapshot flush is
+// what a restart scenario is written to prove.
+func (cm *ComposeManager) RestartService(ctx context.Context, service string) error {
+	container, err := cm.compose.ServiceContainer(ctx, service)
+	if err != nil {
+		return fmt.Errorf("failed to look up service %s: %w", service, err)
+	}
+
+	log.Printf("Restarting service %s...", service)
+	stopTimeout := ServiceStopTimeout
+	if err := container.Stop(ctx, &stopTimeout); err != nil {
+		return fmt.Errorf("failed to stop service %s: %w", service, err)
+	}
+	if err := container.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start service %s: %w", service, err)
+	}
+
+	healthCtx, cancel := context.WithTimeout(ctx, DefaultStartupTimeout)
+	defer cancel()
+	if err := cm.WaitForHealthy(healthCtx); err != nil {
+		return fmt.Errorf("service %s did not become healthy after restart: %w", service, err)
+	}
+	log.Printf("Service %s restarted and healthy", service)
+	return nil
 }
 
 // Cleanup stops and removes all Docker Compose services.

@@ -72,23 +72,14 @@ services:
     environment:
       # Placeholder only, never dialled: validateKafkaConfig runs unconditionally
       # at startup and rejects an empty broker list, so an ASB-only deployment
-      # must still name one. The .invalid TLD (RFC 2606) can never resolve, so a
-      # connection attempt would be an unmistakable bug rather than a silent
-      # fallback. Tracked for review: validate a driver's config only when a
-      # binding uses that driver.
+      # must still name one. 
       - APIP_EGW_KAFKA_BROKERS=unused.invalid:9092
 
       # The namespace comes from the host environment and is never written to a
       # file in this repository.
       - APIP_EGW_ASB_CONNECTION_STRING=${APIP_EGW_ASB_CONNECTION_STRING:?set APIP_EGW_ASB_CONNECTION_STRING before running the ASB stack}
-      # Azure's floor is five minutes. The shortest legal value keeps orphaned
-      # entities from a crashed run out of the namespace quickly.
       - APIP_EGW_ASB_SUBSCRIPTION_IDLE_TIMEOUT_SECONDS=300
 
-      # Pinned so the driver's internal cache-* and sync-* subscription names
-      # stay stable across a restart within one run — the restart scenario
-      # cannot work otherwise. Overridable so parallel CI runs against a shared
-      # namespace can each take a distinct identity.
       - APIP_EGW_RUNTIME_ID=${APIP_EGW_RUNTIME_ID:-egw-it-asb}
 
       - APIP_EGW_SERVER_WEBSUB_ENABLED=true
@@ -102,7 +93,6 @@ services:
       - APIP_EGW_LOGGING_LEVEL=debug
       - APIP_EGW_CONTROLPLANE_XDS_ADDRESS=gateway-controller:18001
     extra_hosts:
-      # Allow callbacks to services running on the Docker host (useful on Linux).
       - "host.docker.internal:host-gateway"
     volumes:
       - ../gateway/gateway-controller/listener-certs:/etc/event-gateway/tls:ro
