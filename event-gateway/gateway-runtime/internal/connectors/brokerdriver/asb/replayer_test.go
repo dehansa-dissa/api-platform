@@ -650,3 +650,46 @@ func TestLeaderLoop_ShutdownFlushSkippedWhenNothingPending(t *testing.T) {
 		t.Fatalf("expected no shutdown write with nothing pending, got %d", got)
 	}
 }
+
+func TestMarkPublished_ReportsHowLongTheChangeWasUnpublished(t *testing.T) {
+	s := newTestCompactedState()
+
+	s.applyToCache(&connectors.Message{Key: []byte("topic:cb"), Value: []byte(`{"active":true}`)})
+	time.Sleep(15 * time.Millisecond)
+
+	exposure, subscribers := s.markPublished(s.cacheVersion())
+
+	if exposure < 10*time.Millisecond {
+		t.Fatalf("expected the reported window to cover the wait, got %s", exposure)
+	}
+	if subscribers != 1 {
+		t.Fatalf("expected the snapshot to hold 1 subscriber, got %d", subscribers)
+	}
+}
+
+func TestMarkPublished_ClockStartsAtTheOldestUnpublishedChange(t *testing.T) {
+	s := newTestCompactedState()
+
+	s.applyToCache(&connectors.Message{Key: []byte("first"), Value: []byte("a")})
+	time.Sleep(15 * time.Millisecond)
+	s.applyToCache(&connectors.Message{Key: []byte("second"), Value: []byte("b")})
+
+	exposure, _ := s.markPublished(s.cacheVersion())
+
+	if exposure < 10*time.Millisecond {
+		t.Fatalf("window measured from the newest change, not the oldest: got %s", exposure)
+	}
+}
+
+func TestMarkPublished_WindowResetsAfterAWrite(t *testing.T) {
+	s := newTestCompactedState()
+
+	s.applyToCache(&connectors.Message{Key: []byte("k"), Value: []byte("v")})
+	if exposure, _ := s.markPublished(s.cacheVersion()); exposure == 0 {
+		t.Fatal("expected a non-zero window for a change that was actually pending")
+	}
+
+	if exposure, _ := s.markPublished(s.cacheVersion()); exposure != 0 {
+		t.Fatalf("expected no window when the cache and snapshot already agree, got %s", exposure)
+	}
+}

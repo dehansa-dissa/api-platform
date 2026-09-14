@@ -90,23 +90,19 @@ type compactedTopicState struct {
 
 	driver *ASBBrokerDriver
 
-	mu    sync.RWMutex
-	cache map[string][]byte // key -> latest value; tombstoned keys are absent
-
-	// version counts cache mutations; publishedVersion is the version the last
-	// successful snapshot write covered. A counter rather than a "dirty" bool:
-	// a change landing mid-publish would be cleared by that publish completing,
-	// whereas a counter leaves version ahead and the next tick still writes.
+	mu               sync.RWMutex
+	cache            map[string][]byte // key -> latest value; tombstoned keys are absent
 	version          uint64
 	publishedVersion uint64
 
-	// dirty flags "cache changed since the last snapshot". Buffered to 1 and
-	// written non-blockingly, so many changes collapse into one signal.
+	// dirtySince is when the oldest currently-unpublished change landed, or the
+	// zero time when the cache and the snapshot agree. It measures the window in
+	// which a crash would lose that change
+	dirtySince time.Time
+
 	dirty chan struct{}
 
 	// seeded records whether the cache was built from the existing snapshot.
-	// Set once before the goroutines start and never written again, so it needs
-	// no lock. An unseeded instance must never lead — see runLeaderElection.
 	seeded bool
 
 	cancel context.CancelFunc
@@ -362,6 +358,10 @@ func (s *compactedTopicState) applyToCache(msg *connectors.Message) {
 		s.cache[key] = msg.Value
 	}
 	s.version++
+	// Only the first change after a write starts the clock
+	if s.dirtySince.IsZero() {
+		s.dirtySince = time.Now()
+	}
 	s.mu.Unlock()
 
 	s.markDirty()
@@ -375,11 +375,20 @@ func (s *compactedTopicState) cacheVersion() uint64 {
 	return s.version
 }
 
-// markPublished records the version a successful snapshot write covered.
-func (s *compactedTopicState) markPublished(version uint64) {
+// markPublished records the version a successful write covered, and reports how
+// long the oldest change in it had been unpublished along with how many
+// subscribers the snapshot now holds.
+func (s *compactedTopicState) markPublished(version uint64) (exposure time.Duration, subscribers int) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.publishedVersion = version
-	s.mu.Unlock()
+	subscribers = len(s.cache)
+	if !s.dirtySince.IsZero() {
+		exposure = time.Since(s.dirtySince)
+		s.dirtySince = time.Time{}
+	}
+	return exposure, subscribers
 }
 
 // hasUnpublishedChanges reports whether the cache has moved on since the last
@@ -434,10 +443,7 @@ func (s *compactedTopicState) snapshotCache() map[string][]byte {
 // acting as leader for as long as it holds the lock.
 //
 // A cache that failed to seed is incomplete and can never become complete: the
-// live tail only carries changes published from now on, so state predating this
-// instance is unrecoverable without the snapshot. Leading with it would publish
-// that partial cache over the real snapshot and lose every subscriber missing
-// from it, so an unseeded instance stays a follower until restarted.
+// live tail only carries changes published from now on.
 func (s *compactedTopicState) runLeaderElection(ctx context.Context) {
 	if !s.seeded {
 		slog.Warn("Not contending for compacted-topic leadership: cache is unseeded", "topic", s.topic)
@@ -606,7 +612,15 @@ func (s *compactedTopicState) publishTracked(ctx context.Context, publish func(c
 	if err := publish(ctx); err != nil {
 		return err
 	}
-	s.markPublished(version)
+
+	// The only place the durability window is observable. Until this line the
+	// change existed solely in memory, and nothing else in the driver reports
+	// for how long.
+	exposure, subscribers := s.markPublished(version)
+	slog.Info("Compacted-topic snapshot written",
+		"topic", s.topic,
+		"subscribers", subscribers,
+		"unpublished_for", exposure.Round(time.Millisecond))
 	return nil
 }
 
