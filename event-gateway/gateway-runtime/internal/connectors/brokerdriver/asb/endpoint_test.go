@@ -1,31 +1,15 @@
-/*
- * Copyright (c) 2026, WSO2 LLC. (https://www.wso2.com).
- *
- * WSO2 LLC. licenses this file to you under the Apache License,
- * Version 2.0 (the "License"); you may not use this file except
- * in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
 package asb
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -50,8 +34,7 @@ func loadFixture(t *testing.T, name string) fixture {
 	path := filepath.Join("testdata", name+".json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("missing fixture %s: %v\nrecord it with: "+
-			"go test -tags asbrecord -run TestRecordFixtures ./internal/connectors/brokerdriver/asb/", path, err)
+		t.Fatalf("missing fixture %s: %v", path, err)
 	}
 
 	var f fixture
@@ -153,5 +136,91 @@ func respondInOrder(t *testing.T, names ...string) func(*http.Request) (*http.Re
 func respondStatus(status int) func(*http.Request) (*http.Response, error) {
 	return func(req *http.Request) (*http.Response, error) {
 		return fixture{Status: status}.response(req), nil
+	}
+}
+
+func assertRequested(t *testing.T, calls *[]recordedCall, method, pathSuffix string) {
+	t.Helper()
+
+	for _, call := range *calls {
+		if call.Method == method && strings.HasPrefix(call.Path, pathSuffix) {
+			return
+		}
+	}
+	t.Fatalf("no %s request to %q; the driver made: %v", method, pathSuffix, describeCalls(*calls))
+}
+
+func describeCalls(calls []recordedCall) []string {
+	out := make([]string, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, call.Method+" "+call.Path)
+	}
+	return out
+}
+
+func TestTopicExists_MissingTopicAnswersFalse(t *testing.T) {
+	driver, calls := mockAdmin(t, alwaysRespond(t, "topic_get_missing"))
+
+	exists, err := driver.TopicExists(context.Background(), "absent-topic")
+	if err != nil {
+		t.Fatalf("a missing topic is an answer, not a failure: %v", err)
+	}
+	if exists {
+		t.Fatal("reported a topic as present that the namespace does not have")
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected exactly one lookup, got %d", len(*calls))
+	}
+}
+
+func TestTopicExists_PresentTopicAnswersTrue(t *testing.T) {
+	driver, calls := mockAdmin(t, alwaysRespond(t, "topic_get_200"))
+
+	exists, err := driver.TopicExists(context.Background(), "present-topic")
+	if err != nil {
+		t.Fatalf("TopicExists returned an error for a topic that exists: %v", err)
+	}
+	if !exists {
+		t.Fatal("reported an existing topic as absent")
+	}
+	assertRequested(t, calls, http.MethodGet, "/present-topic")
+}
+
+func TestTopicExists_ServerFailureIsAnErrorNotAnAnswer(t *testing.T) {
+	driver, _ := mockAdmin(t, respondStatus(http.StatusInternalServerError))
+
+	exists, err := driver.TopicExists(context.Background(), "any-topic")
+	if err == nil {
+		t.Fatal("a server failure must surface as an error, not as a confident false")
+	}
+	if exists {
+		t.Fatal("expected exists to be false alongside the error")
+	}
+}
+
+func TestEnsureTopics_ConflictIsTreatedAsSuccess(t *testing.T) {
+	driver, calls := mockAdmin(t, alwaysRespond(t, "topic_create_409"))
+
+	if err := driver.EnsureTopics(context.Background(), []string{"existing-topic"}, nil); err != nil {
+		t.Fatalf("a conflicting create must not fail an idempotent ensure: %v", err)
+	}
+	assertRequested(t, calls, http.MethodPut, "/existing-topic")
+}
+
+func TestEnsureTopics_ServerFailureAbortsStartup(t *testing.T) {
+	driver, _ := mockAdmin(t, respondStatus(http.StatusInternalServerError))
+
+	if err := driver.EnsureTopics(context.Background(), []string{"some-topic"}, nil); err == nil {
+		t.Fatal("expected a server failure during ensure to abort")
+	}
+}
+
+func TestDeleteCompactionQueues_MissingQueuesAreExpected(t *testing.T) {
+	driver, calls := mockAdmin(t, alwaysRespond(t, "queue_delete_404"))
+
+	driver.deleteCompactionQueues(context.Background(), "a-topic")
+
+	if len(*calls) != 2 {
+		t.Fatalf("expected the snapshot and leader-lock queues to be attempted, got %d calls", len(*calls))
 	}
 }

@@ -35,6 +35,28 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
+// messageReceiver is the subset of *azservicebus.Receiver the consume path
+// uses. The SDK's type is concrete and its methods open AMQP links, which left
+// handleMessage unreachable from a test — and handleMessage is where a message
+// is settled, the difference between delivering an event once and twice. The
+// settle bug that shipped in this file got through precisely because no test
+// could call it.
+type messageReceiver interface {
+	ReceiveMessages(ctx context.Context, maxMessages int, options *azservicebus.ReceiveMessagesOptions) (
+		[]*azservicebus.ReceivedMessage, error)
+	CompleteMessage(ctx context.Context, message *azservicebus.ReceivedMessage,
+		options *azservicebus.CompleteMessageOptions) error
+	DeadLetterMessage(ctx context.Context, message *azservicebus.ReceivedMessage,
+		options *azservicebus.DeadLetterOptions) error
+	RenewMessageLock(ctx context.Context, message *azservicebus.ReceivedMessage,
+		options *azservicebus.RenewMessageLockOptions) error
+	Close(ctx context.Context) error
+}
+
+// Compile-time proof the SDK type still satisfies it. An SDK upgrade that
+// changes a signature fails here rather than at the assignment in NewConsumer.
+var _ messageReceiver = (*azservicebus.Receiver)(nil)
+
 const maxSubscriptionNameLength = 50
 
 const (

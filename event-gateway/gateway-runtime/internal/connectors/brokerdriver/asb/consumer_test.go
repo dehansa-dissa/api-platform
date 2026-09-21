@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/admin"
 	"github.com/Azure/go-amqp"
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
@@ -383,5 +387,379 @@ func TestRunHandler_LockLostCancelsHandlerAndDropsLock(t *testing.T) {
 		}
 	default:
 		t.Fatal("handler was never cancelled after the lock was lost")
+	}
+}
+
+type fakeReceiver struct {
+	mu sync.Mutex
+
+	completed    int
+	deadLettered int
+	renewals     int
+	closed       int
+
+	completeErr   error
+	deadLetterErr error
+	renewErr      error
+
+	deadLetterReason string
+}
+
+func (f *fakeReceiver) ReceiveMessages(context.Context, int, *azservicebus.ReceiveMessagesOptions) (
+	[]*azservicebus.ReceivedMessage, error) {
+	return nil, errors.New("not used by these tests")
+}
+
+func (f *fakeReceiver) CompleteMessage(context.Context, *azservicebus.ReceivedMessage,
+	*azservicebus.CompleteMessageOptions) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.completeErr != nil {
+		return f.completeErr
+	}
+	f.completed++
+	return nil
+}
+
+func (f *fakeReceiver) DeadLetterMessage(_ context.Context, _ *azservicebus.ReceivedMessage,
+	options *azservicebus.DeadLetterOptions) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deadLetterErr != nil {
+		return f.deadLetterErr
+	}
+	f.deadLettered++
+	if options != nil && options.Reason != nil {
+		f.deadLetterReason = *options.Reason
+	}
+	return nil
+}
+
+func (f *fakeReceiver) RenewMessageLock(context.Context, *azservicebus.ReceivedMessage,
+	*azservicebus.RenewMessageLockOptions) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewals++
+	return f.renewErr
+}
+
+func (f *fakeReceiver) Close(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed++
+	return nil
+}
+
+func (f *fakeReceiver) counts() (completed, deadLettered int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.completed, f.deadLettered
+}
+
+func receivedMessage(deliveryCount uint32) *azservicebus.ReceivedMessage {
+	sequence := int64(1)
+	return &azservicebus.ReceivedMessage{
+		Body:           []byte(`{"id":1}`),
+		DeliveryCount:  deliveryCount,
+		SequenceNumber: &sequence,
+	}
+}
+
+func TestHandleMessage_CompletesAHealthyMessage(t *testing.T) {
+	receiver := &fakeReceiver{}
+	c := &Consumer{
+		topic:    "cache-settle01",
+		groupID:  "grp-settle",
+		receiver: receiver,
+		mode:     settleAutoComplete,
+		handler:  func(context.Context, *connectors.Message) error { return nil },
+	}
+
+	c.handleMessage(context.Background(), receivedMessage(1))
+
+	completed, deadLettered := receiver.counts()
+	if completed != 1 {
+		t.Fatalf("message was completed %d times, want 1 — an unsettled message is redelivered", completed)
+	}
+	if deadLettered != 0 {
+		t.Errorf("a healthy message was dead-lettered %d times, want 0", deadLettered)
+	}
+}
+
+func TestHandleMessage_DeadLettersAFailedHandler(t *testing.T) {
+	receiver := &fakeReceiver{}
+	c := &Consumer{
+		topic:    "cache-settle02",
+		groupID:  "grp-settle",
+		receiver: receiver,
+		mode:     settleOnHandlerResult,
+		handler:  func(context.Context, *connectors.Message) error { return errors.New("subscriber refused") },
+	}
+
+	c.handleMessage(context.Background(), receivedMessage(1))
+
+	completed, deadLettered := receiver.counts()
+	if deadLettered != 1 {
+		t.Fatalf("message was dead-lettered %d times, want 1", deadLettered)
+	}
+	if completed != 0 {
+		t.Errorf("a failed message was also completed %d times, want 0", completed)
+	}
+	if receiver.deadLetterReason == "" {
+		t.Error("dead-letter carried no reason; an operator cannot tell why it is in the queue")
+	}
+}
+
+func TestHandleMessage_AutoCompleteSettlesDespiteAHandlerError(t *testing.T) {
+	receiver := &fakeReceiver{}
+	c := &Consumer{
+		topic:    "cache-settle03",
+		groupID:  "grp-settle",
+		receiver: receiver,
+		mode:     settleAutoComplete,
+		handler:  func(context.Context, *connectors.Message) error { return errors.New("delivery failed") },
+	}
+
+	c.handleMessage(context.Background(), receivedMessage(1))
+
+	completed, deadLettered := receiver.counts()
+	if completed != 1 {
+		t.Errorf("auto-complete mode completed %d messages, want 1", completed)
+	}
+	if deadLettered != 0 {
+		t.Errorf("auto-complete mode dead-lettered %d messages, want 0", deadLettered)
+	}
+}
+
+// A redelivery is an ordinary message: Azure raises DeliveryCount, and nothing
+// about settlement changes. Only the WARN it emits is different.
+func TestHandleMessage_RedeliveryIsSettledLikeAnyOtherMessage(t *testing.T) {
+	receiver := &fakeReceiver{}
+	c := &Consumer{
+		topic:    "cache-settle04",
+		groupID:  "grp-settle",
+		receiver: receiver,
+		mode:     settleAutoComplete,
+		handler:  func(context.Context, *connectors.Message) error { return nil },
+	}
+
+	c.handleMessage(context.Background(), receivedMessage(1))
+	c.handleMessage(context.Background(), receivedMessage(3))
+
+	completed, deadLettered := receiver.counts()
+	if completed != 2 {
+		t.Errorf("completed %d messages, want 2 — a redelivery must settle like any other", completed)
+	}
+	if deadLettered != 0 {
+		t.Errorf("a redelivery was dead-lettered %d times, want 0", deadLettered)
+	}
+}
+
+// A settle that fails must not fall through to a second settle attempt. Azure
+// redelivers the message on its own once the lock lapses.
+func TestHandleMessage_FailedCompleteIsNotFollowedByADeadLetter(t *testing.T) {
+	receiver := &fakeReceiver{completeErr: errors.New("link detached")}
+	c := &Consumer{
+		topic:    "cache-settle05",
+		groupID:  "grp-settle",
+		receiver: receiver,
+		mode:     settleAutoComplete,
+		handler:  func(context.Context, *connectors.Message) error { return nil },
+	}
+
+	c.handleMessage(context.Background(), receivedMessage(1))
+
+	completed, deadLettered := receiver.counts()
+	if completed != 0 {
+		t.Errorf("a failed complete was recorded as completed %d times, want 0", completed)
+	}
+	if deadLettered != 0 {
+		t.Errorf("a failed complete was escalated to a dead-letter %d times, want 0", deadLettered)
+	}
+}
+
+func TestHandleMessage_LapsedLockLeavesTheMessageUnsettled(t *testing.T) {
+	receiver := &fakeReceiver{}
+	c := &Consumer{
+		topic:    "cache-settle06",
+		groupID:  "grp-settle",
+		receiver: receiver,
+		mode:     settleAutoComplete,
+		handler: func(ctx context.Context, _ *connectors.Message) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	c.handleMessageWithBudget(context.Background(), receivedMessage(1), 20*time.Millisecond, time.Hour)
+
+	completed, deadLettered := receiver.counts()
+	if completed != 0 || deadLettered != 0 {
+		t.Fatalf("a message whose lock lapsed was settled anyway (completed=%d dead-lettered=%d)",
+			completed, deadLettered)
+	}
+}
+
+func TestReconcileSubscription_PreservesTheOtherProperties(t *testing.T) {
+	driver, calls := mockAdmin(t, respondInOrder(t, "subscription_get_200", "subscription_update_200"))
+
+	desired := &admin.SubscriptionProperties{AutoDeleteOnIdle: to.Ptr(iso8601Seconds(30 * time.Minute))}
+	if err := driver.reconcileSubscription(context.Background(), "a-topic", "a-sub", desired); err != nil {
+		t.Fatalf("reconcileIdleTimeout returned an error: %v", err)
+	}
+
+	if len(*calls) != 2 {
+		t.Fatalf("expected a read then a write, got %d calls", len(*calls))
+	}
+	sent := (*calls)[1].Body
+	if !strings.Contains(sent, "<AutoDeleteOnIdle>PT1800S</AutoDeleteOnIdle>") {
+		t.Fatalf("the update did not carry the new idle timeout; body was:\n%s", sent)
+	}
+	for _, preserved := range []string{"<LockDuration>PT1M</LockDuration>", "<MaxDeliveryCount>10</MaxDeliveryCount>"} {
+		if !strings.Contains(sent, preserved) {
+			t.Fatalf("the update dropped %s, resetting it to a default; body was:\n%s", preserved, sent)
+		}
+	}
+}
+
+func TestReconcileSubscription_MatchingTimeoutSkipsTheWrite(t *testing.T) {
+	driver, calls := mockAdmin(t, respondInOrder(t, "subscription_get_200"))
+
+	desired := &admin.SubscriptionProperties{AutoDeleteOnIdle: to.Ptr(iso8601Seconds(10 * time.Minute))}
+	if err := driver.reconcileSubscription(context.Background(), "a-topic", "a-sub", desired); err != nil {
+		t.Fatalf("reconcileIdleTimeout returned an error: %v", err)
+	}
+
+	if len(*calls) != 1 {
+		t.Fatalf("expected the read alone, got %d calls — an unchanged timeout was rewritten", len(*calls))
+	}
+}
+
+func TestReconcileSubscription_MissingSubscriptionIsNotAFailure(t *testing.T) {
+	driver, calls := mockAdmin(t, alwaysRespond(t, "subscription_get_missing"))
+
+	desired := &admin.SubscriptionProperties{AutoDeleteOnIdle: to.Ptr(iso8601Seconds(30 * time.Minute))}
+	if err := driver.reconcileSubscription(context.Background(), "a-topic", "gone-sub", desired); err != nil {
+		t.Fatalf("a reclaimed subscription is not a failure to reconcile: %v", err)
+	}
+
+	if len(*calls) != 1 {
+		t.Fatalf("expected the read alone, got %d calls — it tried to update a subscription that is gone", len(*calls))
+	}
+}
+
+func TestReconcileSubscription_UpdatesAChangedMaxDeliveryCount(t *testing.T) {
+	driver, calls := mockAdmin(t, respondInOrder(t, "subscription_get_200", "subscription_update_200"))
+
+	desired := &admin.SubscriptionProperties{MaxDeliveryCount: to.Ptr(int32(20))}
+	if err := driver.reconcileSubscription(context.Background(), "a-topic", "a-sub", desired); err != nil {
+		t.Fatalf("reconcileSubscription returned an error: %v", err)
+	}
+
+	if len(*calls) != 2 {
+		t.Fatalf("expected a read then a write, got %d calls", len(*calls))
+	}
+	sent := (*calls)[1].Body
+	if !strings.Contains(sent, "<MaxDeliveryCount>20</MaxDeliveryCount>") {
+		t.Fatalf("the update did not carry the new max delivery count; body was:\n%s", sent)
+	}
+	if !strings.Contains(sent, "<AutoDeleteOnIdle>PT10M</AutoDeleteOnIdle>") {
+		t.Fatalf("reconciling one property reset another; body was:\n%s", sent)
+	}
+}
+
+func TestReconcileSubscription_MatchingPropertiesSkipTheWrite(t *testing.T) {
+	driver, calls := mockAdmin(t, respondInOrder(t, "subscription_get_200"))
+
+	desired := &admin.SubscriptionProperties{
+		AutoDeleteOnIdle: to.Ptr(iso8601Seconds(10 * time.Minute)),
+		MaxDeliveryCount: to.Ptr(int32(10)),
+	}
+	if err := driver.reconcileSubscription(context.Background(), "a-topic", "a-sub", desired); err != nil {
+		t.Fatalf("reconcileSubscription returned an error: %v", err)
+	}
+
+	if len(*calls) != 1 {
+		t.Fatalf("expected the read alone, got %d calls — unchanged properties were rewritten", len(*calls))
+	}
+}
+
+func TestCreateSubscription_ConflictReconcilesTheIdleTimeout(t *testing.T) {
+	driver, calls := mockAdmin(t, respondInOrder(t,
+		"subscription_create_409", "subscription_get_200", "subscription_update_200"))
+
+	props := &admin.SubscriptionProperties{AutoDeleteOnIdle: to.Ptr(iso8601Seconds(30 * time.Minute))}
+	if err := driver.createSubscription(context.Background(), "a-topic", "a-sub", props); err != nil {
+		t.Fatalf("a conflicting create must still succeed: %v", err)
+	}
+
+	if len(*calls) != 3 {
+		t.Fatalf("expected create, read, update; got %d calls", len(*calls))
+	}
+	if !strings.Contains((*calls)[2].Body, "<AutoDeleteOnIdle>PT1800S</AutoDeleteOnIdle>") {
+		t.Fatal("the conflict did not carry the configured idle timeout through to an update")
+	}
+}
+
+func TestCreateSubscription_DurableSubscriptionSkipsTheReadBack(t *testing.T) {
+	driver, calls := mockAdmin(t, respondInOrder(t, "subscription_create_409"))
+
+	if err := driver.createSubscription(context.Background(), "a-topic", "a-sub", nil); err != nil {
+		t.Fatalf("a conflicting durable create must succeed: %v", err)
+	}
+
+	if len(*calls) != 1 {
+		t.Fatalf("expected the create alone, got %d calls", len(*calls))
+	}
+}
+
+func TestConsumerStop_EphemeralDeletesItsSubscription(t *testing.T) {
+	driver, calls := mockAdmin(t, alwaysRespond(t, "topic_delete_200"))
+
+	receiver, err := driver.client.NewReceiverForSubscription("ws-topic", "grp-abc", nil)
+	if err != nil {
+		t.Fatalf("failed to build a receiver: %v", err)
+	}
+	consumer := &Consumer{
+		receiver:  receiver,
+		topic:     "ws-topic",
+		ephemeral: true,
+		driver:    driver,
+		groupID:   "grp-abc",
+	}
+
+	if err := consumer.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error: %v", err)
+	}
+
+	if len(*calls) != 1 {
+		t.Fatalf("expected one delete, got %d calls", len(*calls))
+	}
+	if got := (*calls)[0]; got.Method != http.MethodDelete ||
+		!strings.HasSuffix(got.Path, "/ws-topic/Subscriptions/grp-abc") {
+		t.Fatalf("expected a DELETE of the connection's subscription, got %s %s", got.Method, got.Path)
+	}
+}
+
+func TestConsumerStop_DurableKeepsItsSubscription(t *testing.T) {
+	driver, calls := mockAdmin(t, alwaysRespond(t, "topic_delete_200"))
+
+	receiver, err := driver.client.NewReceiverForSubscription("websub-topic", "grp-xyz", nil)
+	if err != nil {
+		t.Fatalf("failed to build a receiver: %v", err)
+	}
+	consumer := &Consumer{
+		receiver: receiver,
+		topic:    "websub-topic",
+		driver:   driver,
+		groupID:  "grp-xyz",
+	}
+
+	if err := consumer.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error: %v", err)
+	}
+
+	if len(*calls) != 0 {
+		t.Fatalf("a durable consumer deleted its subscription on stop: %v", *calls)
 	}
 }

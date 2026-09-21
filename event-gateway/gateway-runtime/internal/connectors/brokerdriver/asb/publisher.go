@@ -31,6 +31,17 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
+// messageSender is the subset of *azservicebus.Sender the publish path uses,
+// for the same reason as messageReceiver in consumer.go: Publish encodes the
+// message, and what a fake records is the only way to assert what actually
+// reached the wire without a namespace.
+type messageSender interface {
+	SendMessage(ctx context.Context, message *azservicebus.Message, options *azservicebus.SendMessageOptions) error
+	Close(ctx context.Context) error
+}
+
+var _ messageSender = (*azservicebus.Sender)(nil)
+
 // Application-property keys for connectors.Message fields with no native ASB
 // equivalent. ASB has no Kafka-style tombstone, so it is encoded explicitly.
 const (
