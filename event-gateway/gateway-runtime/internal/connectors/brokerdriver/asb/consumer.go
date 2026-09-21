@@ -31,10 +31,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/admin"
+
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// Azure Service Bus caps a subscription name at 50 characters.
 const maxSubscriptionNameLength = 50
 
 const (
@@ -42,9 +42,14 @@ const (
 	receiveRetryMax  = 30 * time.Second
 )
 
-// backoffDelay grows the retry interval exponentially to receiveRetryMax and
-// adds jitter, so replicas that lost the namespace together do not retry in
-// lockstep and stampede it on recovery.
+const (
+	messageLockRenewInterval = 20 * time.Second
+	messageLockRenewTimeout  = 10 * time.Second
+	maxMessageProcessingTime = 5 * time.Minute
+)
+
+// backoffDelay grows the retry interval to receiveRetryMax, with jitter so
+// replicas do not retry in lockstep.
 func backoffDelay(attempt int) time.Duration {
 	delay := receiveRetryMax
 	if attempt < 5 {
@@ -53,19 +58,28 @@ func backoffDelay(attempt int) time.Duration {
 	return delay + rand.N(delay/2)
 }
 
-// sleepBackoff waits out a failed receive, reporting false if ctx ended first.
-func sleepBackoff(ctx context.Context, attempt int) bool {
+// sleepFor waits d, reporting false if ctx ended first. Every timed wait in this
+// package routes through it, so cancellation behaves the same way everywhere and
+// no waiter holds a timer past its own return.
+func sleepFor(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(backoffDelay(attempt)):
+	case <-timer.C:
 		return true
 	}
 }
 
+// sleepBackoff waits out a failed receive, reporting false if ctx ended first.
+func sleepBackoff(ctx context.Context, attempt int) bool {
+	return sleepFor(ctx, backoffDelay(attempt))
+}
+
 // settleMode mirrors the two Kafka consumer variants. Handler failure never
-// abandons the message — the Deliverer owns retry, and abandoning would compound
-// two retry systems. A crash still redelivers via lock expiry.
+// abandons: the Deliverer owns retry, and a crash still redelivers via lock expiry.
 type settleMode int
 
 const (
@@ -75,16 +89,13 @@ const (
 
 // Consumer consumes events from a single ASB topic through one subscription.
 type Consumer struct {
-	receiver *azservicebus.Receiver
+	receiver messageReceiver
 	topic    string
 	handler  connectors.MessageHandler
 	mode     settleMode
 
-	// ephemeral: Stop deletes the subscription. Set only by NewConsumer, whose
-	// WebSocket callers mint a groupID per connection.
 	ephemeral bool
-	// disposable: the subscription carries AutoDeleteOnIdle, so reopen must
-	// recreate it the same way rather than as a durable one.
+
 	disposable bool
 	driver     *ASBBrokerDriver
 	groupID    string
@@ -156,9 +167,8 @@ func (c *Consumer) consumeLoop(ctx context.Context) {
 	}
 }
 
-// reopen recreates a subscription that vanished underneath the receiver and
-// rebuilds the receiver on it. Reachable via AutoDeleteOnIdle reclaiming a
-// disposable subscription, or an operator deleting any of them by hand.
+// reopen recreates a subscription that vanished underneath the receiver, whether
+// reclaimed by AutoDeleteOnIdle or deleted by hand.
 func (c *Consumer) reopen(ctx context.Context) error {
 	if c.driver == nil || c.groupID == "" {
 		return fmt.Errorf("consumer is not bound to a driver")
@@ -185,20 +195,45 @@ func (c *Consumer) reopen(ctx context.Context) error {
 }
 
 func (c *Consumer) handleMessage(ctx context.Context, rm *azservicebus.ReceivedMessage) {
+	c.handleMessageWithBudget(ctx, rm, maxMessageProcessingTime, messageLockRenewInterval)
+}
+
+// handleMessageWithBudget takes the handler budget and renewal cadence as
+// parameters so a test can drive the lapsed-lock path in milliseconds instead
+// of the five real minutes production allows, the same shape as runHandler.
+func (c *Consumer) handleMessageWithBudget(ctx context.Context, rm *azservicebus.ReceivedMessage,
+	budget, renewInterval time.Duration) {
+
 	slog.Debug("[7] Message read from ASB",
 		"topic", c.topic,
 		"sequence_number", rm.SequenceNumber,
 		"delivery_count", rm.DeliveryCount,
 		"size_bytes", len(rm.Body))
 
-	msg := receivedMessageToMessage(rm, c.topic)
-	handlerErr := c.handler(ctx, msg)
-	if handlerErr != nil {
-		slog.Error("Message handler error",
+	if rm.DeliveryCount > 1 {
+		slog.Warn("ASB message redelivered after an unsettled attempt",
 			"topic", c.topic,
+			"subscription", c.groupID,
 			"sequence_number", rm.SequenceNumber,
-			"error", handlerErr,
+			"delivery_count", rm.DeliveryCount,
 		)
+	}
+
+	msg := receivedMessageToMessage(rm, c.topic)
+
+	handlerErr, lockHeld := c.runHandler(ctx, msg, budget, renewInterval,
+		func(renewCtx context.Context) error {
+			return c.receiver.RenewMessageLock(renewCtx, rm, nil)
+		})
+
+	if !lockHeld && ctx.Err() == nil {
+		slog.Warn("Left ASB message unsettled: lock no longer held",
+			"topic", c.topic,
+			"subscription", c.groupID,
+			"sequence_number", rm.SequenceNumber,
+			"delivery_count", rm.DeliveryCount,
+		)
+		return
 	}
 
 	if c.mode == settleOnHandlerResult && handlerErr != nil {
@@ -208,14 +243,96 @@ func (c *Consumer) handleMessage(ctx context.Context, rm *azservicebus.ReceivedM
 			Reason:           &reason,
 			ErrorDescription: &desc,
 		}); err != nil {
-			slog.Error("Failed to dead-letter ASB message", "topic", c.topic, "error", err)
+			c.reportSettleFailure(ctx, "Failed to dead-letter ASB message", err)
+			return
 		}
+
+		slog.Warn("Dead-lettered ASB message: delivery failed permanently",
+			"topic", c.topic,
+			"subscription", c.groupID,
+			"sequence_number", rm.SequenceNumber,
+			"delivery_count", rm.DeliveryCount,
+			"reason", reason,
+			"error", handlerErr,
+		)
 		return
 	}
 
-	if err := c.receiver.CompleteMessage(ctx, rm, nil); err != nil {
-		slog.Error("Failed to complete ASB message", "topic", c.topic, "error", err)
+	if handlerErr != nil {
+		slog.Error("Message handler error",
+			"topic", c.topic,
+			"sequence_number", rm.SequenceNumber,
+			"error", handlerErr,
+		)
 	}
+
+	if err := c.receiver.CompleteMessage(ctx, rm, nil); err != nil {
+		c.reportSettleFailure(ctx, "Failed to complete ASB message", err)
+	}
+}
+
+// runHandler runs the handler with the message lock held open, reporting whether
+// it finished while the lock was still ours.
+func (c *Consumer) runHandler(ctx context.Context, msg *connectors.Message, budget, renewInterval time.Duration,
+	renew func(context.Context) error) (handlerErr error, lockHeld bool) {
+
+	// Derived once and never reassigned: the lockHeld read below depends on this
+	// being the timeout's own context, and an earlier version got that wrong.
+	handlerCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	renewed := make(chan struct{})
+	go func() {
+		defer close(renewed)
+		c.renewLock(handlerCtx, cancel, renewInterval, renew)
+	}()
+
+	handlerErr = c.handler(handlerCtx, msg)
+	lockHeld = handlerCtx.Err() == nil
+
+	cancel()
+	<-renewed
+	return handlerErr, lockHeld
+}
+
+// renewLock keeps one message's lock alive until ctx ends.
+func (c *Consumer) renewLock(ctx context.Context, cancel context.CancelFunc, interval time.Duration, renew func(context.Context) error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewCtx, renewCancel := context.WithTimeout(ctx, messageLockRenewTimeout)
+			err := renew(renewCtx)
+			renewCancel()
+
+			switch {
+			case err == nil:
+			case ctx.Err() != nil:
+				return
+			case isLockLostErr(err):
+				slog.Warn("ASB message lock lost while handling; stopping delivery",
+					"topic", c.topic, "subscription", c.groupID, "error", err)
+				cancel()
+				return
+			default:
+				slog.Debug("ASB message lock renewal failed, retrying",
+					"topic", c.topic, "error", err)
+			}
+		}
+	}
+}
+
+// reportSettleFailure logs a failed settle at the level it deserves.
+func (c *Consumer) reportSettleFailure(ctx context.Context, msg string, err error) {
+	if ctx.Err() != nil {
+		slog.Debug("ASB message settle cancelled during teardown", "topic", c.topic, "error", err)
+		return
+	}
+	slog.Error(msg, "topic", c.topic, "error", err)
 }
 
 // MultiTopicConsumer exposes one Consumer per topic as a single connectors.Receiver.
@@ -223,8 +340,7 @@ type MultiTopicConsumer struct {
 	consumers []*Consumer
 }
 
-// Start begins consuming on every topic. On failure the whole set is stopped:
-// Stop is safe on an unstarted consumer, and the rest would strand receivers.
+// Start begins consuming on every topic.
 func (m *MultiTopicConsumer) Start(ctx context.Context) error {
 	for _, c := range m.consumers {
 		if err := c.Start(ctx); err != nil {
@@ -248,16 +364,12 @@ func (m *MultiTopicConsumer) Stop(ctx context.Context) error {
 	return firstErr
 }
 
-// NewConsumer creates a consumer that auto-completes every message, mirroring
-// the Kafka driver's auto-commit Consumer. Its subscriptions are ephemeral:
-// Stop deletes them. Callers needing durability use NewManualCommitConsumer.
+// NewConsumer auto-completes every message. Its subscriptions are ephemeral: Stop deletes them.
 func NewConsumer(e *ASBBrokerDriver, groupID string, topics []string, handler connectors.MessageHandler) (*MultiTopicConsumer, error) {
 	return newMultiTopicConsumer(e, groupID, topics, handler, settleAutoComplete, true)
 }
 
-// NewManualCommitConsumer completes on handler success and dead-letters on
-// failure — the ASB analogue of Kafka's manual offset commit. The subscription
-// is durable and survives Stop.
+// NewManualCommitConsumer completes on success and dead-letters on failure.
 func NewManualCommitConsumer(e *ASBBrokerDriver, groupID string, topics []string, handler connectors.MessageHandler) (*MultiTopicConsumer, error) {
 	return newMultiTopicConsumer(e, groupID, topics, handler, settleOnHandlerResult, false)
 }
@@ -275,7 +387,6 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 	consumers := make([]*Consumer, 0, len(topics))
 	created := make([]string, 0, len(topics))
 
-	// Ephemeral subscriptions are deleted too: nothing else knows about them.
 	unwind := func() {
 		for _, c := range consumers {
 			if err := c.receiver.Close(ctx); err != nil {
@@ -339,9 +450,8 @@ func (e *ASBBrokerDriver) SubscribeManual(groupID string, topics []string, handl
 	return NewManualCommitConsumer(e, groupID, topics, handler)
 }
 
-// Watch tails a topic from the current position until ctx is cancelled.
-// consumerID gives a stable subscription name so the read position survives
-// restarts, mirroring Kafka's consumer-group-per-consumerID approach.
+// Watch tails a topic until ctx is cancelled. consumerID names the subscription,
+// so the read position survives a restart.
 func (e *ASBBrokerDriver) Watch(ctx context.Context, consumerID string, topic string, handler connectors.MessageHandler) (connectors.Receiver, error) {
 	subscriptionName := syncSubscriptionName(consumerID)
 
@@ -367,21 +477,33 @@ func (e *ASBBrokerDriver) Watch(ctx context.Context, consumerID string, topic st
 	}, nil
 }
 
-// ensureSubscription idempotently creates a durable ASB subscription; 409 is
-// success. Durable subscriptions outlive idle periods and are removed only by
-// DeleteSubscription, because a quiet subscriber must not lose its backlog.
+// ensureSubscription idempotently creates a durable subscription; 409 is success.
+// Durable because a quiet subscriber must not lose its backlog.
 func (e *ASBBrokerDriver) ensureSubscription(ctx context.Context, topic, subscriptionName string) error {
-	return e.createSubscription(ctx, topic, subscriptionName, nil)
+	return e.createSubscription(ctx, topic, subscriptionName, e.subscriptionProps(false))
 }
 
 // ensureDisposableSubscription creates a subscription Azure reclaims once idle.
 func (e *ASBBrokerDriver) ensureDisposableSubscription(ctx context.Context, topic, subscriptionName string) error {
-	if e.cfg.SubscriptionIdleTimeout <= 0 {
-		return e.createSubscription(ctx, topic, subscriptionName, nil)
+	return e.createSubscription(ctx, topic, subscriptionName, e.subscriptionProps(true))
+}
+
+// subscriptionProps builds the properties this driver asserts, or nil when none
+// are configured. nil keeps a conflicting create free of a read-back.
+func (e *ASBBrokerDriver) subscriptionProps(disposable bool) *admin.SubscriptionProperties {
+	var props *admin.SubscriptionProperties
+	if disposable && e.cfg.SubscriptionIdleTimeout > 0 {
+		props = &admin.SubscriptionProperties{
+			AutoDeleteOnIdle: to.Ptr(iso8601Seconds(e.cfg.SubscriptionIdleTimeout)),
+		}
 	}
-	return e.createSubscription(ctx, topic, subscriptionName, &admin.SubscriptionProperties{
-		AutoDeleteOnIdle: to.Ptr(iso8601Seconds(e.cfg.SubscriptionIdleTimeout)),
-	})
+	if e.cfg.MaxDeliveryCount > 0 {
+		if props == nil {
+			props = &admin.SubscriptionProperties{}
+		}
+		props.MaxDeliveryCount = to.Ptr(e.cfg.MaxDeliveryCount)
+	}
+	return props
 }
 
 func (e *ASBBrokerDriver) createSubscription(ctx context.Context, topic, subscriptionName string, props *admin.SubscriptionProperties) error {
@@ -399,22 +521,17 @@ func (e *ASBBrokerDriver) createSubscription(ctx context.Context, topic, subscri
 	if props == nil {
 		return nil
 	}
-	if err := e.reconcileIdleTimeout(ctx, topic, subscriptionName, props); err != nil {
-		// Not fatal: the subscription exists and is usable, only its reclaim
-		// window is stale, and an early reclaim is already self-healed on 404.
-		slog.Warn("Failed to update asb subscription idle timeout",
+	if err := e.reconcileSubscription(ctx, topic, subscriptionName, props); err != nil {
+		slog.Warn("Failed to update asb subscription properties",
 			"topic", topic, "subscription", subscriptionName, "error", err)
 	}
 	return nil
 }
 
-// reconcileIdleTimeout applies a changed AutoDeleteOnIdle to a subscription that
-// already exists. Create answers 409 without touching the entity, so without
-// this a subscription keeps the timeout it was born with and a raised
-// subscription_idle_timeout_seconds never reaches the subscriptions already out
-// there — only ones created afterwards.
-func (e *ASBBrokerDriver) reconcileIdleTimeout(ctx context.Context, topic, subscriptionName string, desired *admin.SubscriptionProperties) error {
-	if desired.AutoDeleteOnIdle == nil {
+// reconcileSubscription applies changed properties to an existing subscription,
+// which a 409 create leaves untouched.
+func (e *ASBBrokerDriver) reconcileSubscription(ctx context.Context, topic, subscriptionName string, desired *admin.SubscriptionProperties) error {
+	if desired.AutoDeleteOnIdle == nil && desired.MaxDeliveryCount == nil {
 		return nil
 	}
 	existing, err := e.admin.GetSubscription(ctx, topic, subscriptionName, nil)
@@ -425,26 +542,34 @@ func (e *ASBBrokerDriver) reconcileIdleTimeout(ctx context.Context, topic, subsc
 	if existing == nil {
 		return nil
 	}
-	if existing.AutoDeleteOnIdle != nil && *existing.AutoDeleteOnIdle == *desired.AutoDeleteOnIdle {
+
+	// Update replaces the whole entity, so start from what Get returned and swap
+	// only what changed; desired alone would reset the rest to defaults.
+	updated := existing.SubscriptionProperties
+	changed := false
+	if desired.AutoDeleteOnIdle != nil &&
+		(existing.AutoDeleteOnIdle == nil || !sameIdleTimeout(*existing.AutoDeleteOnIdle, *desired.AutoDeleteOnIdle)) {
+		updated.AutoDeleteOnIdle = desired.AutoDeleteOnIdle
+		changed = true
+	}
+	if desired.MaxDeliveryCount != nil &&
+		(existing.MaxDeliveryCount == nil || *existing.MaxDeliveryCount != *desired.MaxDeliveryCount) {
+		updated.MaxDeliveryCount = desired.MaxDeliveryCount
+		changed = true
+	}
+	if !changed {
 		return nil
 	}
 
-	// Update replaces the whole entity, so send back what Get returned with only
-	// the idle timeout swapped — passing desired alone would reset every other
-	// property to an SDK default.
-	updated := existing.SubscriptionProperties
-	updated.AutoDeleteOnIdle = desired.AutoDeleteOnIdle
 	if _, err := e.admin.UpdateSubscription(ctx, topic, subscriptionName, updated, nil); err != nil {
 		return err
 	}
-	slog.Info("Updated asb subscription idle timeout",
-		"topic", topic, "subscription", subscriptionName, "idle_timeout", *desired.AutoDeleteOnIdle)
+	slog.Info("Updated asb subscription properties",
+		"topic", topic, "subscription", subscriptionName)
 	return nil
 }
 
-// DeleteSubscription removes a subscriber's durable ASB Subscription. Kept off
-// connectors.BrokerDriver — Kafka consumer groups need no cleanup — and found by
-// ConsumerManager through an optional-capability type assertion.
+// DeleteSubscription removes a subscriber's durable Subscription.
 func (e *ASBBrokerDriver) DeleteSubscription(ctx context.Context, groupID string, topic string) error {
 	if _, err := e.admin.DeleteSubscription(ctx, topic, groupID, nil); err != nil {
 		if isNotFoundErr(err) {
@@ -455,10 +580,8 @@ func (e *ASBBrokerDriver) DeleteSubscription(ctx context.Context, groupID string
 	return nil
 }
 
-// subscriptionNameFor maps a groupID onto a valid ASB subscription name. Group
-// IDs are sized for Kafka's unlimited names; the WebSocket paths compose one at
-// 53 characters, over ASB's 50. Short names pass through, longer ones hash —
-// deterministically, so a durable subscriber finds its subscription again.
+// subscriptionNameFor maps a groupID onto a valid ASB subscription name. Short
+// ones pass through; longer hash deterministically, so a restart finds them again.
 func subscriptionNameFor(groupID string) (string, error) {
 	if groupID == "" {
 		return "", fmt.Errorf("asb subscription name must not be empty")

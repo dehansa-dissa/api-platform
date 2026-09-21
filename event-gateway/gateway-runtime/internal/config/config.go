@@ -21,6 +21,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -71,11 +72,6 @@ type ServerConfig struct {
 	AdminPort                    int    `koanf:"admin_port"`
 	MetricsPort                  int    `koanf:"metrics_port"`
 
-	// ReadTimeout, WriteTimeout, and IdleTimeout bound the WebSub/WebSocket
-	// managed HTTP(S) servers (see newManagedServer) so a slow or malicious
-	// client can't hold a connection open indefinitely (Slowloris-style
-	// resource exhaustion). MaxHeaderBytes bounds header size the same way.
-	// All four must be non-zero — DefaultConfig supplies safe defaults.
 	ReadTimeout    time.Duration `koanf:"read_timeout"`
 	WriteTimeout   time.Duration `koanf:"write_timeout"`
 	IdleTimeout    time.Duration `koanf:"idle_timeout"`
@@ -98,10 +94,9 @@ type KafkaConfig struct {
 
 // ASBConfig holds Azure Service Bus connection settings.
 type ASBConfig struct {
-	ConnectionString string `koanf:"connection_string"`
-	// SubscriptionIdleTimeoutSeconds bounds how long Azure keeps one of the
-	// driver's disposable subscriptions alive with no activity.
-	SubscriptionIdleTimeoutSeconds int `koanf:"subscription_idle_timeout_seconds"`
+	ConnectionString               string `koanf:"connection_string"`
+	SubscriptionIdleTimeoutSeconds int    `koanf:"subscription_idle_timeout_seconds"`
+	MaxDeliveryCount               int    `koanf:"max_delivery_count"`
 }
 
 // WebSubConfig holds WebSub-specific settings.
@@ -134,34 +129,6 @@ type LoggingConfig struct {
 	Format string `koanf:"format"`
 }
 
-// HTTPClientConfig configures the shared outbound *http.Client used by WebSub's
-// subscribe/unsubscribe intent verification (Verifier, see
-// internal/connectors/receiver/websub/verification.go) and message delivery
-// (Deliverer, see .../delivery.go). Both call sites dial a tenant/subscriber-supplied
-// CallbackURL and share the identical pooling/TLS/proxy/SSRF posture, so a single
-// [http_client] TOML section configures both; each call site still keeps its own
-// existing timeout parameter/field (Verifier's `timeout` argument, sourced from
-// websub.verification_timeout_seconds; Deliverer's own delivery timeout), which always
-// overrides Timeouts.Overall below for that specific client — see BuildHTTPClientConfig.
-//
-// This mirrors the TOML-expressible subset of
-// github.com/wso2/api-platform/httpkit/httpclient.Config (see gateway-controller's
-// pkg/config.HTTPClientConfig for the reference shape this intentionally mirrors
-// field-for-field, aside from SSRF below). Go-only callback hooks
-// (GetClientCertificate, VerifyPeerCertificate, VerifyConnection, ConnectHeader) and a
-// pre-built *x509.CertPool have no TOML shape and are not represented here.
-//
-// Unlike gateway-controller's HTTPClientConfig, SSRF protection is NOT configurable
-// off: every CallbackURL dialed by either client is tenant/subscriber-supplied —
-// exactly the scenario ssrf-prevention.md targets — so SSRF.Enabled=true and
-// netguard.PermitPrivateBlockMetadata() are hardcoded in BuildHTTPClientConfig rather
-// than sourced from this struct. PermitPrivateBlockMetadata (not the stricter PublicOnly)
-// is deliberate: WebSub subscribers routinely live on private networks by design (a
-// Kubernetes ClusterIP, a docker-compose service, a localhost port during development —
-// see the preset's own doc comment), so blocking RFC 1918/loopback would break that core,
-// intended deployment shape. Link-local (where the cloud metadata endpoint lives),
-// unspecified, and multicast/broadcast addresses stay refused regardless. Only the
-// redirect/scheme knobs netguard exposes are configurable, via HTTPClientSSRFConfig.
 type HTTPClientConfig struct {
 	Pooling  HTTPClientPoolingConfig  `koanf:"pooling"`
 	Timeouts HTTPClientTimeoutsConfig `koanf:"timeouts"`
@@ -178,27 +145,17 @@ type HTTPClientPoolingConfig struct {
 	IdleConnTimeout     time.Duration `koanf:"idle_conn_timeout"`
 	KeepAlive           time.Duration `koanf:"keep_alive"`
 	DisableKeepAlives   bool          `koanf:"disable_keep_alives"`
-	// EnableHTTP2 opts into HTTP/2. See httpclient.PoolingConfig.EnableHTTP2's doc comment
-	// on the HTTP/2 connection-coalescing caveat before enabling.
-	EnableHTTP2 bool `koanf:"enable_http2"`
+	EnableHTTP2         bool          `koanf:"enable_http2"`
 }
 
-// HTTPClientTimeoutsConfig mirrors httpclient.TimeoutsConfig. Overall is only a common
-// default shared by both call sites — see HTTPClientConfig's doc comment for why each
-// call site's own existing timeout always takes precedence over it.
+// HTTPClientTimeoutsConfig mirrors httpclient.TimeoutsConfig.
 type HTTPClientTimeoutsConfig struct {
-	Overall        time.Duration `koanf:"overall"`
-	Dial           time.Duration `koanf:"dial"`
-	TLSHandshake   time.Duration `koanf:"tls_handshake"`
-	ResponseHeader time.Duration `koanf:"response_header"`
-	ExpectContinue time.Duration `koanf:"expect_continue"`
-	// MaxResponseBytes bounds a callback response body. 0 = package default
-	// (10MiB). Unlike httpclient.TimeoutsConfig.MaxResponseBytes, a negative
-	// value here is rejected by BuildHTTPClientConfig rather than disabling
-	// the bound: every response body this client reads comes from a
-	// tenant/subscriber-supplied CallbackURL, so an unbounded read is never
-	// an acceptable opt-in for this client (see file-access.md directive 5).
-	MaxResponseBytes int64 `koanf:"max_response_bytes"`
+	Overall          time.Duration `koanf:"overall"`
+	Dial             time.Duration `koanf:"dial"`
+	TLSHandshake     time.Duration `koanf:"tls_handshake"`
+	ResponseHeader   time.Duration `koanf:"response_header"`
+	ExpectContinue   time.Duration `koanf:"expect_continue"`
+	MaxResponseBytes int64         `koanf:"max_response_bytes"`
 }
 
 // HTTPClientTLSConfig mirrors the TOML-expressible subset of httpclient.TLSConfig.
@@ -212,49 +169,27 @@ type HTTPClientTLSConfig struct {
 	ClientKeyFile    string `koanf:"client_key_file"`
 }
 
-// HTTPClientProxyConfig mirrors the TOML-expressible subset of httpclient.ProxyConfig.
 type HTTPClientProxyConfig struct {
-	// Mode selects how the proxy is determined: "none" (default), "environment"
-	// (HTTP_PROXY/HTTPS_PROXY/NO_PROXY), or "url" (URL/Username/Password/NoProxy below).
 	Mode     string   `koanf:"mode"`
 	URL      string   `koanf:"url"`
 	Username string   `koanf:"username"`
 	Password string   `koanf:"password"`
 	NoProxy  []string `koanf:"no_proxy"` // exact host, ".suffix", or CIDR entries; only used when mode == "url"
 
-	TLS HTTPClientProxyTLSConfig `koanf:"tls"`
-
-	// Egress states how origin-destination SSRF risk is handled when a forward proxy is
-	// also configured: "delegated" (trust the proxy's own egress controls) or
-	// "manual_connect" (validate the origin locally before ever issuing CONNECT). Must be
-	// set explicitly whenever Mode != "none" — SSRF guarding is always enabled for this
-	// client (see HTTPClientConfig's doc comment), unlike gateway-controller where this
-	// is only required when SSRF is ALSO enabled. BuildHTTPClientConfig fails closed at
-	// config-build time otherwise rather than silently choosing one.
-	Egress string `koanf:"egress"`
+	TLS    HTTPClientProxyTLSConfig `koanf:"tls"`
+	Egress string                   `koanf:"egress"`
 }
 
 // HTTPClientProxyTLSConfig mirrors httpclient.ProxyTLSConfig (the proxy's own TLS
 // handshake, fully decoupled from the origin TLS handshake in HTTPClientTLSConfig).
 type HTTPClientProxyTLSConfig struct {
-	RootCAFile     string `koanf:"root_ca_file"`
-	ClientCertFile string `koanf:"client_cert_file"`
-	ClientKeyFile  string `koanf:"client_key_file"`
-	// InsecureSkipVerify and InsecureSkipVerifyAcknowledged are deliberately
-	// separate fields: httpkit's own acknowledgement gate
-	// (httpclient.ProxyTLSConfig, see tls.go) requires an operator to opt
-	// into disabling verification twice, once per field, so a single
-	// "insecure_skip_verify = true" in TOML can't silently satisfy its own
-	// gate. Both must be explicitly set to true for InsecureSkipVerify to
-	// take effect.
-	InsecureSkipVerify             bool `koanf:"insecure_skip_verify"`
-	InsecureSkipVerifyAcknowledged bool `koanf:"insecure_skip_verify_acknowledged"`
+	RootCAFile                     string `koanf:"root_ca_file"`
+	ClientCertFile                 string `koanf:"client_cert_file"`
+	ClientKeyFile                  string `koanf:"client_key_file"`
+	InsecureSkipVerify             bool   `koanf:"insecure_skip_verify"`
+	InsecureSkipVerifyAcknowledged bool   `koanf:"insecure_skip_verify_acknowledged"`
 }
 
-// HTTPClientSSRFConfig mirrors the TOML-expressible redirect/scheme knobs of
-// httpclient.SSRFConfig. It deliberately has NO Enabled/Preset field: SSRF guarding for
-// this client is always on with netguard.PermitPrivateBlockMetadata() (see
-// HTTPClientConfig's doc comment) — there is no supported way to disable it via config.
 type HTTPClientSSRFConfig struct {
 	MaxRedirects   int      `koanf:"max_redirects"`   // 0 uses netguard's own default (5)
 	AllowedSchemes []string `koanf:"allowed_schemes"` // empty defaults to {"https"}
@@ -305,7 +240,7 @@ func DefaultConfig() *Config {
 				KeepAlive:           30 * time.Second,
 			},
 			Timeouts: HTTPClientTimeoutsConfig{
-				Overall:        30 * time.Second, // common default only; each call site's own timeout overrides this
+				Overall:        30 * time.Second,
 				Dial:           10 * time.Second,
 				TLSHandshake:   10 * time.Second,
 				ResponseHeader: 10 * time.Second,
@@ -336,9 +271,6 @@ func Load(path string) (*Config, map[string]interface{}, error) {
 		}
 	}
 
-	// Load environment variable overrides. Single underscores separate the
-	// top-level section from the field name, while field-name underscores are
-	// preserved (for example SERVER_WEBSUB_PORT -> server.websub_port).
 	if err := k.Load(env.ProviderWithValue("APIP_EGW_", ".", func(key, value string) (string, interface{}) {
 		mapped := mapEnvKey(key)
 		if mapped == "" {
@@ -357,10 +289,6 @@ func Load(path string) (*Config, map[string]interface{}, error) {
 		return nil, nil, err
 	}
 
-	// Extract the raw map for policy_configurations (used for ${config} resolution).
-	// k.Raw() returns a nested map[string]interface{} which is what the policy engine's
-	// SetConfig/config resolver expects. k.All() returns a flat dot-separated map and
-	// would cause ${config.policy_configurations.*} references to fail silently.
 	rawConfig := k.Raw()
 
 	slog.Info("Configuration loaded",
@@ -400,7 +328,6 @@ func mapEnvKey(key string) string {
 	case strings.HasPrefix(name, "logging_"):
 		return "logging." + strings.TrimPrefix(name, "logging_")
 	default:
-		// Support generic nested keys using "__" for literal underscores.
 		name = strings.ReplaceAll(name, "__", "%UNDERSCORE%")
 		name = strings.ReplaceAll(name, "_", ".")
 		name = strings.ReplaceAll(name, "%UNDERSCORE%", "_")
@@ -429,7 +356,8 @@ func mapEnvValue(path, value string) interface{} {
 		if n, err := strconv.Atoi(value); err == nil {
 			return n
 		}
-	case "kafka.tls", "controlplane.enabled", "server.websub_enabled", "server.websub_tls_enabled", "server.websocket_tls_enabled":
+	case "kafka.tls", "controlplane.enabled", "server.websub_enabled", "server.websub_tls_enabled",
+		"server.websocket_tls_enabled":
 		if b, err := strconv.ParseBool(value); err == nil {
 			return b
 		}
@@ -515,13 +443,14 @@ func validate(cfg *Config) error {
 // missing its connection string, rather than letting the driver fail lazily
 // on first use with a less specific error.
 func validateASBConfig(asbCfg ASBConfig) error {
-	// Azure rejects an AutoDeleteOnIdle below five minutes, so catch it here
-	// rather than on the first subscription create.
 	if asbCfg.SubscriptionIdleTimeoutSeconds < 0 {
 		return fmt.Errorf("asb.subscription_idle_timeout_seconds must not be negative")
 	}
 	if asbCfg.SubscriptionIdleTimeoutSeconds > 0 && asbCfg.SubscriptionIdleTimeoutSeconds < 300 {
 		return fmt.Errorf("asb.subscription_idle_timeout_seconds must be 0 (disabled) or at least 300, got %d", asbCfg.SubscriptionIdleTimeoutSeconds)
+	}
+	if asbCfg.MaxDeliveryCount < 0 || asbCfg.MaxDeliveryCount > math.MaxInt32 {
+		return fmt.Errorf("asb.max_delivery_count must be between 0 and %d, got %d", math.MaxInt32, asbCfg.MaxDeliveryCount)
 	}
 	if strings.TrimSpace(asbCfg.ConnectionString) == "" {
 		return nil
@@ -534,10 +463,7 @@ func validateASBConfig(asbCfg ASBConfig) error {
 
 // validateListenerTLSTuning validates the optional min/max TLS version,
 // cipher suite, and curve preference tuning for one of the inbound HTTPS
-// listeners (WebSub or WebSocket). All four fields are optional — leaving
-// them empty defers to Go's own crypto/tls defaults — but if set, they must
-// name a value tlsconfig recognizes. fieldPrefix is used to qualify the
-// returned error (e.g. "server.websub_tls").
+// listeners (WebSub or WebSocket).
 func validateListenerTLSTuning(fieldPrefix, minVersion, maxVersion, cipherSuites, curvePreferences string) error {
 	if err := tlsconfig.ValidateVersionRange(minVersion, maxVersion); err != nil {
 		return fmt.Errorf("%s_min_version/%s_max_version: %w", fieldPrefix, fieldPrefix, err)
@@ -627,9 +553,7 @@ func validateServerPorts(serverCfg ServerConfig) error {
 
 // validateServerTimeouts rejects a zero/negative read/write/idle timeout or
 // max-header-byte ceiling on the managed WebSub/WebSocket HTTP(S) servers —
-// the zero value for http.Server leaves these unbounded, which is exactly
-// the Slowloris-style exposure this configuration exists to close (see
-// go-network-service-hardening.md directive 1).
+// the zero value for http.Server leaves these unbounded.
 func validateServerTimeouts(serverCfg ServerConfig) error {
 	if serverCfg.ReadTimeout <= 0 {
 		return fmt.Errorf("server.read_timeout must be positive, got %s", serverCfg.ReadTimeout)

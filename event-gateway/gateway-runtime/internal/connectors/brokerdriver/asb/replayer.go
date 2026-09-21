@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -35,13 +36,8 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// ASB has no equivalent of Kafka's log compaction: a consumed message is gone,
-// and a new Subscription never receives messages published before it existed.
-// Instead each instance folds the sync topic into an in-memory cache, and
-// whichever instance holds the leader-lock session writes that cache to a
-// snapshot queue. Replay reads only the snapshot. Leadership uses a
-// session-enabled queue: ASB allows one holder per session ID and expires the
-// lock on its own if that holder dies.
+// ASB has no log compaction, so each instance caches the sync topic and the
+// leader writes that cache to a snapshot queue
 const (
 	compactionSnapshotInterval       = 30 * time.Second
 	compactionLockRenewBefore        = 20 * time.Second
@@ -80,9 +76,8 @@ func defaultLeaderTimings() leaderTimings {
 	}
 }
 
-// compactedTopicState owns the leader-election goroutine and live cache for
-// one compacted topic. Started by EnsureCompactedTopic, stopped by
-// ASBBrokerDriver.Close or stopCompactedTopic.
+// compactedTopicState owns the leader-election goroutine and live cache for one
+// compacted topic. Started by EnsureCompactedTopic.
 type compactedTopicState struct {
 	topic         string
 	snapshotQueue string
@@ -95,23 +90,16 @@ type compactedTopicState struct {
 	version          uint64
 	publishedVersion uint64
 
-	// dirtySince is when the oldest currently-unpublished change landed, or the
-	// zero time when the cache and the snapshot agree. It measures the window in
-	// which a crash would lose that change
 	dirtySince time.Time
-
-	dirty chan struct{}
-
-	// seeded records whether the cache was built from the existing snapshot.
-	seeded bool
+	dirty      chan struct{}
+	seeded     bool
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-// EnsureCompactedTopic idempotently provisions the topic plus its snapshot and
-// leader-lock queues, seeds the cache from any existing snapshot, and starts
-// the live-tail and leader-election goroutines.
+// EnsureCompactedTopic provisions the topic and its two queues, seeds the cache
+// from any existing snapshot, and starts the live-tail and election goroutines.
 func (e *ASBBrokerDriver) EnsureCompactedTopic(ctx context.Context, topic string) error {
 	if _, err := e.admin.CreateTopic(ctx, topic, nil); err != nil && !isConflictErr(err) {
 		return fmt.Errorf("failed to create compacted topic %s: %w", topic, err)
@@ -197,7 +185,7 @@ func (e *ASBBrokerDriver) stopCompactedTopicLocked(topic string) {
 }
 
 // Replay calls handler once per key in the current snapshot with that key's
-// latest value. Raw topic history is never consulted; ASB cannot provide it.
+// latest value.
 func (e *ASBBrokerDriver) Replay(ctx context.Context, topic string, handler connectors.MessageHandler) error {
 	var handlerErr error
 	replayed := 0
@@ -220,9 +208,8 @@ func (e *ASBBrokerDriver) Replay(ctx context.Context, topic string, handler conn
 	return nil
 }
 
-// replaySnapshotInto peeks the snapshot queue and invokes visit per key. Peek
-// is non-destructive, so the snapshot survives any number of reads. An empty
-// queue means no state has been recorded yet, which is not an error.
+// replaySnapshotInto peeks the snapshot queue and invokes visit per key. Peek,
+// not receive: a consuming read would delete the state every instance needs.
 func (e *ASBBrokerDriver) replaySnapshotInto(ctx context.Context, snapshotQueue string, visit func(key string, value []byte)) error {
 	receiver, err := e.client.NewReceiverForQueue(snapshotQueue, nil)
 	if err != nil {
@@ -256,9 +243,7 @@ func (e *ASBBrokerDriver) replaySnapshotInto(ctx context.Context, snapshotQueue 
 	return nil
 }
 
-// runLiveTail keeps state.cache current from a per-instance subscription on the
-// compacted topic. Separate from subscription.SyncWatcher's: every instance
-// needs its own full copy of the stream, not a competing one.
+// runLiveTail keeps the cache current from a per-instance subscription.
 func (s *compactedTopicState) runLiveTail(ctx context.Context) {
 	subscriptionName := cacheSubscriptionName(s.driver.instanceID)
 
@@ -279,9 +264,6 @@ func (s *compactedTopicState) runLiveTail(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			// Reclaimed by AutoDeleteOnIdle on a quiet topic. Recreating alone
-			// would leave the cache missing whatever was published meanwhile,
-			// so rebuildCacheTail replays the snapshot over it.
 			if isNotFoundErr(err) {
 				if rebuilt, rebuildErr := s.rebuildCacheTail(ctx, receiver, subscriptionName); rebuildErr == nil {
 					slog.Info("Rebuilt reclaimed compacted-topic cache subscription", "topic", s.topic)
@@ -321,9 +303,8 @@ func (s *compactedTopicState) openCacheReceiver(ctx context.Context, subscriptio
 	return receiver, nil
 }
 
-// rebuildCacheTail recreates a reclaimed cache subscription and refills the
-// cache from the snapshot, which is the only remaining record of anything
-// published while the subscription was gone.
+// rebuildCacheTail recreates a reclaimed subscription and refills the cache from
+// the snapshot, the only record of what was published while it was gone.
 func (s *compactedTopicState) rebuildCacheTail(ctx context.Context, stale *azservicebus.Receiver, subscriptionName string) (*azservicebus.Receiver, error) {
 	receiver, err := s.openCacheReceiver(ctx, subscriptionName)
 	if err != nil {
@@ -338,8 +319,6 @@ func (s *compactedTopicState) rebuildCacheTail(ctx context.Context, stale *azser
 		return nil, fmt.Errorf("failed to refill cache from snapshot: %w", err)
 	}
 
-	// Swapped wholesale, never merged: a key tombstoned while the subscription
-	// was gone is absent from the snapshot, and merging would resurrect it.
 	s.mu.Lock()
 	s.cache = rebuilt
 	s.version++
@@ -375,9 +354,8 @@ func (s *compactedTopicState) cacheVersion() uint64 {
 	return s.version
 }
 
-// markPublished records the version a successful write covered, and reports how
-// long the oldest change in it had been unpublished along with how many
-// subscribers the snapshot now holds.
+// markPublished records the version a write covered, reporting how long its
+// oldest change waited and how many subscribers the snapshot holds.
 func (s *compactedTopicState) markPublished(version uint64) (exposure time.Duration, subscribers int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -411,9 +389,8 @@ func (s *compactedTopicState) markDirty() {
 	}
 }
 
-// drainDirty clears any pending signal. Call before reading the cache, never
-// after: draining afterwards could discard the signal for a change the
-// snapshot missed.
+// drainDirty clears any pending signal. Call before reading the cache: draining
+// after could discard the signal for a change the snapshot missed.
 func (s *compactedTopicState) drainDirty() {
 	if s.dirty == nil {
 		return
@@ -430,20 +407,11 @@ func (s *compactedTopicState) drainDirty() {
 func (s *compactedTopicState) snapshotCache() map[string][]byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make(map[string][]byte, len(s.cache))
-	for k, v := range s.cache {
-		out[k] = v
-	}
-	return out
+	return maps.Clone(s.cache)
 }
 
-// runLeaderElection contends for the "leader" session and runs as leader while
-// it holds the lock.
 // runLeaderElection contends for the leader session until ctx is cancelled,
-// acting as leader for as long as it holds the lock.
-//
-// A cache that failed to seed is incomplete and can never become complete: the
-// live tail only carries changes published from now on.
+// acting as leader while it holds the lock.
 func (s *compactedTopicState) runLeaderElection(ctx context.Context) {
 	if !s.seeded {
 		slog.Warn("Not contending for compacted-topic leadership: cache is unseeded", "topic", s.topic)
@@ -464,11 +432,8 @@ func (s *compactedTopicState) runLeaderElection(ctx context.Context) {
 				slog.Warn("Leader-election attempt failed", "topic", s.topic, "error", err)
 			}
 			s.seedLeaderSessionBestEffort(ctx)
-			delay := compactionElectionRetryBase + rand.N(compactionElectionRetryJitterMax)
-			select {
-			case <-ctx.Done():
+			if !sleepFor(ctx, compactionElectionRetryBase+rand.N(compactionElectionRetryJitterMax)) {
 				return
-			case <-time.After(delay):
 			}
 			continue
 		}
@@ -487,12 +452,8 @@ func (s *compactedTopicState) tryAcquireLeadership(ctx context.Context) (*azserv
 	})
 }
 
-// seedLeaderSessionBestEffort creates the "leader" session by sending to it.
-// Duplicate detection on the queue collapses repeated seeding server-side.
-//
-// The sender must not stay in the publisher's cache: seeding runs only between
-// elections, and Azure force-detaches a link idle for 10 minutes, taking the
-// shared connection — and the leadership term — with it.
+// seedLeaderSessionBestEffort creates the "leader" session by sending to it;
+// duplicate detection collapses repeats.
 func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
 	defer s.driver.publisher.closeSender(s.lockQueue)
 
@@ -519,8 +480,6 @@ func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
 func (s *compactedTopicState) runAsLeader(ctx context.Context, session *azservicebus.SessionReceiver) {
 	defer session.Close(context.Background())
 
-	// Held for the whole term: a fresh AMQP link each cycle could itself consume
-	// publishSnapshot's drain timeout.
 	snapshotReceiver, err := s.driver.client.NewReceiverForQueue(s.snapshotQueue, &azservicebus.ReceiverOptions{
 		ReceiveMode: azservicebus.ReceiveModePeekLock,
 	})
@@ -542,9 +501,7 @@ func (s *compactedTopicState) runAsLeader(ctx context.Context, session *azservic
 	)
 }
 
-// renewWithRetry makes one extra attempt before conceding leadership. Kept
-// shallow: a dropped connection has already released the lock, so further
-// attempts only delay re-election. A lock-lost error skips the retry entirely.
+// renewWithRetry makes one extra attempt before conceding.
 func (s *compactedTopicState) renewWithRetry(ctx context.Context, timings leaderTimings, renewLock func(context.Context) error) error {
 	attempts := timings.renewMaxAttempts
 	if attempts < 1 {
@@ -572,23 +529,15 @@ func (s *compactedTopicState) renewWithRetry(ctx context.Context, timings leader
 		slog.Debug("Leader session lock renewal failed, retrying",
 			"topic", s.topic, "attempt", attempt, "error", err)
 
-		select {
-		case <-ctx.Done():
+		if !sleepFor(ctx, timings.renewRetryDelay) {
 			return ctx.Err()
-		case <-time.After(timings.renewRetryDelay):
 		}
 	}
 	return fmt.Errorf("leader session lock renewal failed after %d attempts: %w", attempts, err)
 }
 
-// runLeaderLoop keeps the session lock alive and decides when to snapshot,
-// returning when ctx is cancelled or the lock cannot be renewed. The dirty
-// signal is the primary trigger; the interval is a safety net. A failed write
-// is not fatal — the cache is still correct and the next trigger retries.
-
-// flushPendingSnapshot writes one final snapshot as the leader steps down for
-// shutdown, on a fresh context because shutdown has already cancelled the loop's
-// own.
+// flushPendingSnapshot writes one final snapshot at shutdown, on a fresh context
+// because shutdown has already cancelled the loop's own.
 func (s *compactedTopicState) flushPendingSnapshot(publish func(context.Context) error) {
 	if !s.hasUnpublishedChanges() {
 		return
@@ -604,18 +553,15 @@ func (s *compactedTopicState) flushPendingSnapshot(publish func(context.Context)
 	slog.Info("Flushed pending compacted-topic snapshot on shutdown", "topic", s.topic)
 }
 
-// publishTracked publishes and, on success, records the version it covered.
-// The version is read before the write, so a change arriving mid-publish leaves
-// the cache ahead and the next tick still picks it up.
+// publishTracked publishes and records the version it covered.
 func (s *compactedTopicState) publishTracked(ctx context.Context, publish func(context.Context) error) error {
 	version := s.cacheVersion()
 	if err := publish(ctx); err != nil {
 		return err
 	}
 
-	// The only place the durability window is observable. Until this line the
-	// change existed solely in memory, and nothing else in the driver reports
-	// for how long.
+	// The only place the durability window is observable: until here the change
+	// existed solely in memory.
 	exposure, subscribers := s.markPublished(version)
 	slog.Info("Compacted-topic snapshot written",
 		"topic", s.topic,
@@ -660,24 +606,19 @@ func (s *compactedTopicState) runLeaderLoop(
 					s.flushPendingSnapshot(publish)
 					return
 				}
-				// No flush: the lock is gone, so another instance may already
-				// be the writer.
 				slog.Warn("Failed to renew leader session lock, stepping down", "topic", s.topic, "error", err)
 				return
 			}
 		case <-s.dirty:
-			select {
-			case <-ctx.Done():
+			if !sleepFor(ctx, timings.debounce) {
 				s.flushPendingSnapshot(publish)
 				return
-			case <-time.After(timings.debounce):
 			}
 			s.drainDirty()
 			s.publishAndReport(ctx, publish, "Failed to publish compacted-topic snapshot after change")
 		case <-snapshotTicker.C:
-			// The interval only covers a change the dirty path failed to write;
-			// republishing a snapshot that already matches the cache would cost
-			// a full write every tick for the lifetime of a quiet topic.
+			// Only covers a change the dirty path failed to write; a quiet topic
+			// would otherwise pay a full write every tick.
 			if !s.hasUnpublishedChanges() {
 				continue
 			}
@@ -688,9 +629,6 @@ func (s *compactedTopicState) runLeaderLoop(
 }
 
 // publishSnapshot replaces the queue's contents with the current cache.
-// Ordering matters: the stale message is locked but not settled until the
-// replacement is sent. Locked messages stay visible to PeekMessages, so a
-// concurrent Replay always sees one snapshot or the other, never an empty queue.
 func (s *compactedTopicState) publishSnapshot(ctx context.Context, receiver *azservicebus.Receiver) error {
 	payload, err := json.Marshal(s.snapshotCache())
 	if err != nil {
@@ -711,8 +649,6 @@ func (s *compactedTopicState) publishSnapshot(ctx context.Context, receiver *azs
 		return fmt.Errorf("failed to open snapshot sender: %w", err)
 	}
 	if err := sender.SendMessage(ctx, &azservicebus.Message{Body: payload}, nil); err != nil {
-		// Leave stale messages unsettled: their locks lapse and the previous
-		// snapshot stays readable.
 		return fmt.Errorf("failed to send snapshot: %w", err)
 	}
 
@@ -728,14 +664,11 @@ func (s *compactedTopicState) publishSnapshot(ctx context.Context, receiver *azs
 func snapshotQueueName(topic string) string   { return topic + "-snapshot" }
 func leaderLockQueueName(topic string) string { return topic + "-leader-lock" }
 
-// cacheSubscriptionName names the per-instance live-tail subscription, hashed
-// to stay inside ASB's 50-character limit.
 func cacheSubscriptionName(runtimeID string) string {
 	return "cache-" + shortHash(runtimeID)
 }
 
-// syncSubscriptionName names the Watch subscription. Hashed: runtimeID plus an
-// API identifier exceeds ASB's 50-character limit outright.
+// syncSubscriptionName names the Watch subscription.
 func syncSubscriptionName(consumerID string) string {
 	return "sync-" + shortHash(consumerID)
 }

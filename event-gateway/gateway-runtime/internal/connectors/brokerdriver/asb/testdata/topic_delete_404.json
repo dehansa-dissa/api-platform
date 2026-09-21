@@ -1,0 +1,7 @@
+{
+  "status": 404,
+  "headers": {
+    "Content-Type": "application/xml; charset=utf-8"
+  },
+  "body": "\u003cError\u003e\u003cCode\u003e404\u003c/Code\u003e\u003cDetail\u003eNo service is hosted at the specified address. TrackingId:de84d62c-5161-464e-9e4c-069754b60db8_G5, SystemTracker:example.servicebus.windows.net:fixture-entity-that-does-not-exist, Timestamp:2026-09-14T07:52:56\u003c/Detail\u003e\u003c/Error\u003e"
+}

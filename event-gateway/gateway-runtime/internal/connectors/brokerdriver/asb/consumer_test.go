@@ -231,3 +231,157 @@ func TestIsNotFoundErr_MatchesAllThreeNotFoundForms(t *testing.T) {
 		}
 	}
 }
+
+func TestSubscriptionProps_NilWhenNothingConfigured(t *testing.T) {
+	driver := &ASBBrokerDriver{}
+
+	if got := driver.subscriptionProps(false); got != nil {
+		t.Errorf("durable subscription asserted properties with none configured: %+v", got)
+	}
+	if got := driver.subscriptionProps(true); got != nil {
+		t.Errorf("disposable subscription asserted properties with none configured: %+v", got)
+	}
+}
+
+func TestSubscriptionProps_IdleTimeoutOnlyForDisposable(t *testing.T) {
+	driver := &ASBBrokerDriver{cfg: ConnectionConfig{SubscriptionIdleTimeout: 10 * time.Minute}}
+
+	if got := driver.subscriptionProps(false); got != nil {
+		t.Errorf("a durable subscription must never carry AutoDeleteOnIdle: %+v", got)
+	}
+	got := driver.subscriptionProps(true)
+	if got == nil || got.AutoDeleteOnIdle == nil || *got.AutoDeleteOnIdle != "PT600S" {
+		t.Fatalf("disposable subscription did not carry the configured idle timeout: %+v", got)
+	}
+}
+
+func TestSubscriptionProps_MaxDeliveryCountAppliesToBoth(t *testing.T) {
+	driver := &ASBBrokerDriver{cfg: ConnectionConfig{MaxDeliveryCount: 20}}
+
+	for _, disposable := range []bool{false, true} {
+		got := driver.subscriptionProps(disposable)
+		if got == nil || got.MaxDeliveryCount == nil || *got.MaxDeliveryCount != 20 {
+			t.Errorf("subscriptionProps(disposable=%v) dropped the max delivery count: %+v", disposable, got)
+		}
+	}
+}
+
+func TestRenewLock_LockLostCancelsHandler(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	c := &Consumer{topic: "t", groupID: "g"}
+	lost := &azservicebus.Error{Code: azservicebus.CodeLockLost}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.renewLock(ctx, cancel, time.Millisecond, func(context.Context) error { return lost })
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("renewLock did not return after the lock was lost")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("expected the handler context to be cancelled after a lost lock")
+	}
+}
+
+func TestRenewLock_TransientFailureKeepsGoing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Consumer{topic: "t", groupID: "g"}
+	attempts := make(chan struct{}, 8)
+
+	go c.renewLock(ctx, cancel, time.Millisecond, func(context.Context) error {
+		select {
+		case attempts <- struct{}{}:
+		default:
+		}
+		return errors.New("namespace briefly unreachable")
+	})
+
+	for i := 0; i < 3; i++ {
+		select {
+		case <-attempts:
+		case <-time.After(time.Second):
+			t.Fatalf("renewal stopped after %d attempts; a transient error must not cancel", i)
+		}
+	}
+	if ctx.Err() != nil {
+		t.Fatal("transient renewal failures must not cancel the handler context")
+	}
+}
+
+func TestRenewLock_StopsWhenContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Consumer{topic: "t", groupID: "g"}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.renewLock(ctx, cancel, time.Hour, func(context.Context) error { return nil })
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("renewLock outlived its context")
+	}
+}
+
+func TestRunHandler_FastHandlerKeepsLock(t *testing.T) {
+	c := &Consumer{topic: "t", groupID: "g", handler: func(context.Context, *connectors.Message) error { return nil }}
+
+	err, lockHeld := c.runHandler(context.Background(), &connectors.Message{},
+		time.Minute, time.Hour, func(context.Context) error { return nil })
+
+	if err != nil {
+		t.Fatalf("handler returned %v, want nil", err)
+	}
+	if !lockHeld {
+		t.Fatal("a handler that returned immediately must still hold its lock, so the message can be settled")
+	}
+}
+func TestRunHandler_BudgetExceededDropsLock(t *testing.T) {
+	c := &Consumer{topic: "t", groupID: "g", handler: func(ctx context.Context, _ *connectors.Message) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+
+	_, lockHeld := c.runHandler(context.Background(), &connectors.Message{},
+		20*time.Millisecond, time.Hour, func(context.Context) error { return nil })
+
+	if lockHeld {
+		t.Fatal("a handler that outran its budget must not report the lock as held")
+	}
+}
+
+func TestRunHandler_LockLostCancelsHandlerAndDropsLock(t *testing.T) {
+	observed := make(chan error, 1)
+	c := &Consumer{topic: "t", groupID: "g", handler: func(ctx context.Context, _ *connectors.Message) error {
+		<-ctx.Done()
+		observed <- ctx.Err()
+		return ctx.Err()
+	}}
+
+	_, lockHeld := c.runHandler(context.Background(), &connectors.Message{},
+		time.Minute, time.Millisecond,
+		func(context.Context) error { return &azservicebus.Error{Code: azservicebus.CodeLockLost} })
+
+	if lockHeld {
+		t.Fatal("lock was lost mid-handling; lockHeld must be false")
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("handler saw %v, want context.Canceled", err)
+		}
+	default:
+		t.Fatal("handler was never cancelled after the lock was lost")
+	}
+}

@@ -1,0 +1,7 @@
+{
+  "status": 409,
+  "headers": {
+    "Content-Type": "application/xml; charset=utf-8"
+  },
+  "body": "\u003cError\u003e\u003cCode\u003e409\u003c/Code\u003e\u003cDetail\u003eSubCode=40900. Conflict. You're requesting an operation that isn't allowed in the resource's current state. To know more visit https://aka.ms/sbResourceMgrExceptions.  ExceptionDescription: sb://example.servicebus.windows.net/fixture-topic-1789372370045593000. TrackingId:bc678970-956f-4b3e-8461-428c080d443d_G5, SystemTracker:example.servicebus.windows.net:fixture-topic-1789372370045593000, Timestamp:2026-09-14T07:52:52\u003c/Detail\u003e\u003c/Error\u003e"
+}

@@ -20,29 +20,33 @@ package asb
 
 import (
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/config"
 )
 
-// minSubscriptionIdleTimeout is the shortest AutoDeleteOnIdle Azure accepts.
 const minSubscriptionIdleTimeout = 5 * time.Minute
 
 // ConnectionConfig holds the Azure Service Bus connection settings used by the driver.
 type ConnectionConfig struct {
-	ConnectionString string
-	// SubscriptionIdleTimeout is applied as AutoDeleteOnIdle to the driver's
-	// disposable subscriptions. Global-only: it protects the namespace against
-	// orphans, so a per-binding override could not safely widen it.
+	ConnectionString        string
 	SubscriptionIdleTimeout time.Duration
+	MaxDeliveryCount        int32
 }
 
 // ResolveConnectionConfig merges global runtime config with per-binding overrides.
 func ResolveConnectionConfig(global config.ASBConfig, overrides map[string]interface{}) (ConnectionConfig, error) {
+	if global.MaxDeliveryCount > math.MaxInt32 {
+		return ConnectionConfig{}, fmt.Errorf("asb max delivery count must not exceed %d, got %d", math.MaxInt32, global.MaxDeliveryCount)
+	}
+
 	cfg := ConnectionConfig{
 		ConnectionString:        global.ConnectionString,
 		SubscriptionIdleTimeout: time.Duration(global.SubscriptionIdleTimeoutSeconds) * time.Second,
+		MaxDeliveryCount:        int32(global.MaxDeliveryCount),
 	}
 
 	if overrides != nil {
@@ -65,8 +69,7 @@ func normalizeConnectionConfig(cfg *ConnectionConfig) {
 }
 
 // validateConnectionConfig fails closed so a misconfigured binding is rejected
-// at startup rather than on first use. The connection string is never echoed
-// into an error: even a malformed value can carry a live SharedAccessKey.
+// at startup rather than on first use.
 func validateConnectionConfig(cfg ConnectionConfig) error {
 	if cfg.ConnectionString == "" {
 		return fmt.Errorf("asb connection string must not be empty")
@@ -76,6 +79,9 @@ func validateConnectionConfig(cfg ConnectionConfig) error {
 	}
 	if cfg.SubscriptionIdleTimeout < 0 {
 		return fmt.Errorf("asb subscription idle timeout must not be negative")
+	}
+	if cfg.MaxDeliveryCount < 0 {
+		return fmt.Errorf("asb max delivery count must not be negative")
 	}
 	if cfg.SubscriptionIdleTimeout > 0 && cfg.SubscriptionIdleTimeout < minSubscriptionIdleTimeout {
 		return fmt.Errorf("asb subscription idle timeout must be 0 (disabled) or at least %s, got %s", minSubscriptionIdleTimeout, cfg.SubscriptionIdleTimeout)
@@ -87,6 +93,73 @@ func validateConnectionConfig(cfg ConnectionConfig) error {
 // expects for AutoDeleteOnIdle.
 func iso8601Seconds(d time.Duration) string {
 	return fmt.Sprintf("PT%dS", int64(d.Seconds()))
+}
+
+const (
+	maxISO8601Len = 64
+	// Largest whole-day count whose nanoseconds still fit an int64.
+	maxISO8601Days = 106751
+)
+
+// sameIdleTimeout compares two ISO-8601 durations by value: Azure normalises
+// what it stores, so PT600S reads back as PT10M. Unparsable falls back to ==.
+func sameIdleTimeout(a, b string) bool {
+	if a == b {
+		return true
+	}
+	left, okLeft := iso8601Duration(a)
+	right, okRight := iso8601Duration(b)
+	return okLeft && okRight && left == right
+}
+
+// iso8601Duration parses the subset the management API emits: optional whole
+// days, then a time part the standard library reads once "PT" is stripped.
+// Months and years are rejected as not being fixed lengths, and so is anything
+// overflowing a time.Duration — Azure renders "never" as ~29,000 years, and a
+// silently wrapped value could compare equal to a real timeout. Unparsable
+// answers false, which callers read as "not equal": a redundant write, never a
+// skipped update.
+func iso8601Duration(value string) (time.Duration, bool) {
+	if len(value) < 3 || len(value) > maxISO8601Len || value[0] != 'P' {
+		return 0, false
+	}
+	rest := value[1:]
+
+	var days time.Duration
+	sawDate := false
+	if i := strings.IndexByte(rest, 'D'); i >= 0 {
+		whole, err := strconv.Atoi(rest[:i])
+		if err != nil || whole < 0 || whole > maxISO8601Days {
+			return 0, false
+		}
+		days, sawDate, rest = time.Duration(whole)*24*time.Hour, true, rest[i+1:]
+	}
+
+	if rest == "" {
+		return days, sawDate
+	}
+	if rest[0] != 'T' || len(rest) == 1 {
+		return 0, false
+	}
+	clock := strings.ToLower(strings.Replace(rest[1:], ",", ".", 1))
+
+	// ParseDuration takes a fraction on any unit; ISO-8601 allows one only on
+	// the final component, which this API always renders as seconds.
+	if i := strings.IndexByte(clock, '.'); i >= 0 {
+		end := i + 1
+		for end < len(clock) && clock[end] >= '0' && clock[end] <= '9' {
+			end++
+		}
+		if clock[end:] != "s" {
+			return 0, false
+		}
+	}
+
+	elapsed, err := time.ParseDuration(clock)
+	if err != nil || elapsed < 0 || elapsed > math.MaxInt64-days {
+		return 0, false
+	}
+	return days + elapsed, true
 }
 
 func stringOverride(value interface{}) (string, bool, error) {

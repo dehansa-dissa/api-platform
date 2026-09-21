@@ -364,9 +364,6 @@ func TestRenewWithRetry_SucceedsWithoutRetryingWhenHealthy(t *testing.T) {
 	}
 }
 
-// The regression this whole change exists for: Azure force-detaches an idle
-// AMQP link every 10 minutes, so a renewal fails while the SDK rebuilds it.
-// Conceding on that single error surrendered leadership on a ~10-minute cycle.
 func TestRenewWithRetry_RidesOutTransientLinkFailure(t *testing.T) {
 	s := newTestCompactedState()
 	renew, calls := failNTimes(1, errors.New("context deadline exceeded"))
@@ -379,9 +376,6 @@ func TestRenewWithRetry_RidesOutTransientLinkFailure(t *testing.T) {
 	}
 }
 
-// Bounded deliberately: a dropped connection releases the session lock
-// server-side, so every further renewal is guaranteed to fail and each one
-// delays the re-election that actually restores a leader.
 func TestRenewWithRetry_ConcedesAfterTheAttemptLimit(t *testing.T) {
 	s := newTestCompactedState()
 	renew, calls := failNTimes(1<<30, errors.New("namespace unreachable"))
@@ -394,8 +388,6 @@ func TestRenewWithRetry_ConcedesAfterTheAttemptLimit(t *testing.T) {
 	}
 }
 
-// A lost lock is not a transport failure: the session is provably gone and
-// another instance may already hold it, so retrying risks two leaders.
 func TestRenewWithRetry_ConcedesImmediatelyWhenLockIsLost(t *testing.T) {
 	s := newTestCompactedState()
 	renew, calls := failNTimes(1<<30, &azservicebus.Error{Code: azservicebus.CodeLockLost})
@@ -473,9 +465,6 @@ func TestLeaderLoop_SurvivesPublishFailure(t *testing.T) {
 	rec := newPublishRecorder()
 	rec.err = errors.New("transient azure failure")
 
-	// A pending change is what the interval exists to rescue. Draining the
-	// dirty signal leaves only the interval path able to fire, so the retries
-	// counted below are the interval's, not the change trigger's.
 	s.applyToCache(&connectors.Message{Key: []byte("k"), Value: []byte("v")})
 	s.drainDirty()
 

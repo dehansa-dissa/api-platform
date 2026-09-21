@@ -27,6 +27,7 @@ import (
 	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
+
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
@@ -41,17 +42,19 @@ const (
 // Publisher publishes events to Azure Service Bus topics. An ASB sender is
 // bound to one entity, so senders are cached per topic or queue and reused.
 type Publisher struct {
-	client *azservicebus.Client
+	newSender func(entity string) (messageSender, error)
 
 	mu      sync.Mutex
-	senders map[string]*azservicebus.Sender
+	senders map[string]messageSender
 }
 
 // NewPublisher creates a new ASB publisher over the shared client.
 func NewPublisher(client *azservicebus.Client) *Publisher {
 	return &Publisher{
-		client:  client,
-		senders: make(map[string]*azservicebus.Sender),
+		newSender: func(entity string) (messageSender, error) {
+			return client.NewSender(entity, nil)
+		},
+		senders: make(map[string]messageSender),
 	}
 }
 
@@ -74,7 +77,7 @@ func (p *Publisher) Publish(ctx context.Context, topic string, msg *connectors.M
 }
 
 // senderFor returns a cached sender, creating one on first use.
-func (p *Publisher) senderFor(entity string) (*azservicebus.Sender, error) {
+func (p *Publisher) senderFor(entity string) (messageSender, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -82,7 +85,7 @@ func (p *Publisher) senderFor(entity string) (*azservicebus.Sender, error) {
 		return sender, nil
 	}
 
-	sender, err := p.client.NewSender(entity, nil)
+	sender, err := p.newSender(entity)
 	if err != nil {
 		return nil, err
 	}
@@ -113,11 +116,10 @@ func (p *Publisher) Close() {
 			slog.Warn("Failed to close asb sender", "entity", entity, "error", err)
 		}
 	}
-	p.senders = make(map[string]*azservicebus.Sender)
+	p.senders = make(map[string]messageSender)
 }
 
-// toServiceBusMessage encodes a connectors.Message for ASB. A nil Value becomes
-// an explicit tombstone marker, so an empty-but-present value stays distinct.
+// toServiceBusMessage encodes a connectors.Message for ASB.
 func toServiceBusMessage(msg *connectors.Message) (*azservicebus.Message, error) {
 	sbMsg := &azservicebus.Message{
 		ApplicationProperties: map[string]any{},
@@ -131,7 +133,6 @@ func toServiceBusMessage(msg *connectors.Message) (*azservicebus.Message, error)
 
 	if len(msg.Key) > 0 {
 		sbMsg.ApplicationProperties[applyPropertyKey] = base64.StdEncoding.EncodeToString(msg.Key)
-		// MessageID drives ASB duplicate detection and is visible in the portal.
 		keyStr := string(msg.Key)
 		sbMsg.MessageID = &keyStr
 	}

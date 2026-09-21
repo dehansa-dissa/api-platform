@@ -35,13 +35,9 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// cacheSubscriptionReleaseTimeout bounds shutdown cleanup so an unreachable
-// namespace cannot stall process exit.
 const cacheSubscriptionReleaseTimeout = 10 * time.Second
 
 // ASBBrokerDriver implements connectors.BrokerDriver for Azure Service Bus.
-// It owns a shared publisher and admin client and tracks per-compacted-topic
-// leader-election state (see replayer.go).
 type ASBBrokerDriver struct {
 	publisher  *Publisher
 	cfg        ConnectionConfig
@@ -60,17 +56,20 @@ func NewClient(cfg ConnectionConfig) (*azservicebus.Client, error) {
 	return azservicebus.NewClientFromConnectionString(cfg.ConnectionString, nil)
 }
 
-// NewBrokerDriver creates an ASB broker-driver from the given connection config.
-// runtimeID names this process's internal subscriptions (see replayer.go); it is
-// a fresh UUID per boot unless runtime_id is configured, so those subscriptions
-// carry AutoDeleteOnIdle to stop each restart stranding one per topic.
+// NewBrokerDriver creates an ASB broker-driver.
 func NewBrokerDriver(cfg ConnectionConfig, runtimeID string) (*ASBBrokerDriver, error) {
+	return newBrokerDriver(cfg, runtimeID, nil)
+}
+
+// newBrokerDriver exposes the admin client's options so a test can replay
+// recorded responses instead of dialling.
+func newBrokerDriver(cfg ConnectionConfig, runtimeID string, adminOpts *admin.ClientOptions) (*ASBBrokerDriver, error) {
 	client, err := NewClient(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create asb client: %w", err)
 	}
 
-	adminClient, err := admin.NewClientFromConnectionString(cfg.ConnectionString, nil)
+	adminClient, err := admin.NewClientFromConnectionString(cfg.ConnectionString, adminOpts)
 	if err != nil {
 		_ = client.Close(context.Background())
 		return nil, fmt.Errorf("failed to create asb admin client: %w", err)
@@ -103,9 +102,7 @@ func (e *ASBBrokerDriver) TopicExists(ctx context.Context, topic string) (bool, 
 	return resp != nil, nil
 }
 
-// EnsureTopics creates topics if they don't already exist (idempotent).
-// metadata is logged for tracking but not stored — ASB topic properties have
-// no place for arbitrary key-value pairs.
+// EnsureTopics creates topics if absent (idempotent).
 func (e *ASBBrokerDriver) EnsureTopics(ctx context.Context, topics []string, metadata map[string]map[string]string) error {
 	for _, topic := range topics {
 		if _, err := e.admin.CreateTopic(ctx, topic, nil); err != nil {
@@ -118,7 +115,6 @@ func (e *ASBBrokerDriver) EnsureTopics(ctx context.Context, topics []string, met
 			slog.Info("Created topic", "topic", topic)
 		}
 
-		// Log metadata for debugging/tracking purposes
 		if metadata != nil && metadata[topic] != nil {
 			slog.Info("Topic metadata",
 				"topic_hash", topic,
@@ -153,9 +149,7 @@ func (e *ASBBrokerDriver) Close() error {
 	return closeErr
 }
 
-// releaseCacheSubscriptions drops this instance's cache subscriptions on a
-// graceful shutdown, returning quota immediately rather than waiting out
-// AutoDeleteOnIdle. Best-effort: a failure is a delayed reclaim, not an error.
+// releaseCacheSubscriptions returns quota on a graceful shutdown rather than waiting out AutoDeleteOnIdle.
 func (e *ASBBrokerDriver) releaseCacheSubscriptions(topics []string) {
 	if len(topics) == 0 {
 		return
@@ -173,9 +167,7 @@ func (e *ASBBrokerDriver) releaseCacheSubscriptions(topics []string) {
 	}
 }
 
-// DeleteTopics deletes the given topics plus any compaction side-queues.
-// Best-effort like the Kafka driver: per-entity failures are logged, not
-// returned, so one already-gone entity does not block a teardown.
+// DeleteTopics deletes the topics plus any compaction side-queues.
 func (e *ASBBrokerDriver) DeleteTopics(ctx context.Context, topics []string) error {
 	for _, topic := range topics {
 		e.publisher.closeSender(topic)
@@ -191,9 +183,8 @@ func (e *ASBBrokerDriver) DeleteTopics(ctx context.Context, topics []string) err
 	return nil
 }
 
-// deleteCompactionQueues removes EnsureCompactedTopic's side-entities, without
-// which a redeployed API would resurrect subscriptions from a stale snapshot.
-// A plain topic has no such queues, so 404 is expected.
+// deleteCompactionQueues removes EnsureCompactedTopic's side-entities, or a
+// redeployed API would resurrect subscribers from a stale snapshot. 404 is expected.
 func (e *ASBBrokerDriver) deleteCompactionQueues(ctx context.Context, topic string) {
 	for _, queue := range []string{snapshotQueueName(topic), leaderLockQueueName(topic)} {
 		e.publisher.closeSender(queue)
@@ -207,9 +198,8 @@ func (e *ASBBrokerDriver) deleteCompactionQueues(ctx context.Context, topic stri
 	}
 }
 
-// isLockLostErr reports that a message or session lock has already expired.
-// Distinct from a transport failure: the lock is provably gone rather than
-// merely unconfirmed, so a caller must concede instead of retrying.
+// isLockLostErr reports a lock that is provably gone rather than merely
+// unconfirmed, so the caller must concede instead of retrying.
 func isLockLostErr(err error) bool {
 	var sbErr *azservicebus.Error
 	return errors.As(err, &sbErr) && sbErr.Code == azservicebus.CodeLockLost
@@ -221,13 +211,8 @@ func isConflictErr(err error) bool {
 	return errors.As(err, &respErr) && respErr.StatusCode == http.StatusConflict
 }
 
-// isNotFoundErr reports "entity does not exist" in all three shapes the SDK
-// delivers it in. The management API answers HTTP 404, and an RPC-path failure
-// is wrapped as CodeNotFound — but a receiver link detaching because its
-// subscription was deleted is neither: TransformError classifies amqp:not-found
-// as RecoveryKindFatal and returns the raw *amqp.Error unwrapped. The receive
-// loops self-heal off this function, so without the third shape they back off
-// forever against a subscription that is never coming back.
+// isNotFoundErr matches all three shapes the SDK delivers: HTTP 404, CodeNotFound,
+// and a bare *amqp.Error. The receive loops self-heal off this.
 func isNotFoundErr(err error) bool {
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {

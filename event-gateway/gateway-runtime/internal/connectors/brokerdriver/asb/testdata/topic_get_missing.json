@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "Content-Type": "application/atom+xml;type=feed;charset=utf-8"
+  },
+  "body": "\u003cfeed xmlns=\"http://www.w3.org/2005/Atom\"\u003e\u003ctitle type=\"text\"\u003ePublicly Listed Services\u003c/title\u003e\u003csubtitle type=\"text\"\u003eThis is the list of publicly-listed services currently available.\u003c/subtitle\u003e\u003cid\u003euuid:64bee7ef-2c03-4313-979d-e24df31ec2d8;id=970007\u003c/id\u003e\u003cupdated\u003e2026-09-14T07:52:53Z\u003c/updated\u003e\u003cgenerator\u003eService Bus 1.1\u003c/generator\u003e\u003c/feed\u003e"
+}
