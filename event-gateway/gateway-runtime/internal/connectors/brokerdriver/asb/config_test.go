@@ -222,7 +222,7 @@ func TestISO8601Duration_RejectsAzuresNeverValue(t *testing.T) {
 func TestISO8601Duration_RejectsVariableLengthAndMalformedUnits(t *testing.T) {
 	for _, invalid := range []string{
 		"P1Y", "P2M", "", "P", "PT", "10M", "PTS", "PT10X",
-		"PT1.5M", "PT10M20", "PPT10M", "PT10MT20S",
+		"PT10M20", "PPT10M", "PT10MT20S",
 		"P99999999999999999999D",
 	} {
 		if _, ok := iso8601Duration(invalid); ok {

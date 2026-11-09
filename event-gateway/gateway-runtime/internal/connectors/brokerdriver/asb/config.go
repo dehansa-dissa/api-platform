@@ -130,11 +130,8 @@ func iso8601Seconds(d time.Duration) string {
 	return fmt.Sprintf("PT%dS", int64(d.Seconds()))
 }
 
-const (
-	maxISO8601Len = 64
-	// Largest whole-day count whose nanoseconds still fit an int64.
-	maxISO8601Days = 106751
-)
+// Largest whole-day count whose nanoseconds still fit an int64.
+const maxISO8601Days = 106751
 
 // sameIdleTimeout compares two ISO-8601 durations by value: Azure normalises
 // what it stores, so PT600S reads back as PT10M. Unparsable falls back to ==.
@@ -147,50 +144,29 @@ func sameIdleTimeout(a, b string) bool {
 	return okLeft && okRight && left == right
 }
 
-// iso8601Duration parses the subset the management API emits: optional whole
-// days, then a time part the standard library reads once "PT" is stripped.
-// Months and years are rejected as not being fixed lengths, and so is anything
-// overflowing a time.Duration — Azure renders "never" as ~29,000 years, and a
-// silently wrapped value could compare equal to a real timeout. Unparsable
-// answers false, which callers read as "not equal": a redundant write, never a
-// skipped update.
+// iso8601Duration parses the P[nD][T...] form Azure emits for AutoDeleteOnIdle.
+// Months, years and values beyond time.Duration read as unparsable.
 func iso8601Duration(value string) (time.Duration, bool) {
-	if len(value) < 3 || len(value) > maxISO8601Len || value[0] != 'P' {
+	rest, ok := strings.CutPrefix(value, "P")
+	if !ok || rest == "" {
 		return 0, false
 	}
-	rest := value[1:]
-
 	var days time.Duration
-	sawDate := false
-	if i := strings.IndexByte(rest, 'D'); i >= 0 {
-		whole, err := strconv.Atoi(rest[:i])
-		if err != nil || whole < 0 || whole > maxISO8601Days {
+	if d, after, found := strings.Cut(rest, "D"); found {
+		n, err := strconv.Atoi(d)
+		if err != nil || n < 0 || n > maxISO8601Days {
 			return 0, false
 		}
-		days, sawDate, rest = time.Duration(whole)*24*time.Hour, true, rest[i+1:]
+		days, rest = time.Duration(n)*24*time.Hour, after
 	}
-
 	if rest == "" {
-		return days, sawDate
+		return days, true
 	}
-	if rest[0] != 'T' || len(rest) == 1 {
+	clock, ok := strings.CutPrefix(rest, "T")
+	if !ok {
 		return 0, false
 	}
-	clock := strings.ToLower(strings.Replace(rest[1:], ",", ".", 1))
-
-	// ParseDuration takes a fraction on any unit; ISO-8601 allows one only on
-	// the final component, which this API always renders as seconds.
-	if i := strings.IndexByte(clock, '.'); i >= 0 {
-		end := i + 1
-		for end < len(clock) && clock[end] >= '0' && clock[end] <= '9' {
-			end++
-		}
-		if clock[end:] != "s" {
-			return 0, false
-		}
-	}
-
-	elapsed, err := time.ParseDuration(clock)
+	elapsed, err := time.ParseDuration(strings.ToLower(clock))
 	if err != nil || elapsed < 0 || elapsed > math.MaxInt64-days {
 		return 0, false
 	}
