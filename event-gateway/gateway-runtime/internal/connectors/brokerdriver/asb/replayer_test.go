@@ -803,7 +803,7 @@ func TestSeedLeaderSession_ExistingAnchorIsNotReseeded(t *testing.T) {
 	// An anchor is never consumed, so a second one stays forever. Only the queue's
 	// own count reliably says whether one already exists.
 	sender := &fakeSender{}
-	driver, _ := mockAdmin(t, func(req *http.Request) (*http.Response, error) {
+	driver, calls := mockAdmin(t, func(req *http.Request) (*http.Response, error) {
 		body := queueRuntimePropertiesXML(1)
 		return &http.Response{
 			StatusCode:    http.StatusOK,
@@ -821,7 +821,7 @@ func TestSeedLeaderSession_ExistingAnchorIsNotReseeded(t *testing.T) {
 		driver:    driver,
 	}
 
-	// The election loop calls this on every failed attempt, a few seconds apart.
+	// The election loop calls this on every failed attempt that was not a held session.
 	for i := 0; i < 20; i++ {
 		s.seedLeaderSessionBestEffort(context.Background())
 	}
@@ -830,11 +830,15 @@ func TestSeedLeaderSession_ExistingAnchorIsNotReseeded(t *testing.T) {
 		t.Fatalf("sent %d anchors while one already existed, want 0 — every extra anchor "+
 			"stays in the lock queue permanently", len(sender.sent))
 	}
+	if len(*calls) != 1 {
+		t.Fatalf("probed the lock queue %d times, want 1 — a known anchor needs no further "+
+			"management calls", len(*calls))
+	}
 }
 
 func TestSeedLeaderSession_UnreadableQueueStillSeeds(t *testing.T) {
 	sender := &fakeSender{}
-	driver, _ := mockAdmin(t, func(*http.Request) (*http.Response, error) {
+	driver, calls := mockAdmin(t, func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("probe unavailable")
 	})
 	driver.home.publisher = testPublisher(sender)
@@ -845,7 +849,11 @@ func TestSeedLeaderSession_UnreadableQueueStillSeeds(t *testing.T) {
 	}
 
 	s.seedLeaderSessionBestEffort(context.Background())
+	s.seedLeaderSessionBestEffort(context.Background())
 
+	if len(*calls) != 1 {
+		t.Fatalf("probed the lock queue %d times, want 1 — a sent anchor needs no further probes", len(*calls))
+	}
 	if len(sender.sent) != 1 {
 		t.Fatalf("sent %d anchors, want 1 — an unreadable queue must not stop the seed, "+
 			"or a transient admin failure leaves the topic permanently leaderless", len(sender.sent))
@@ -1177,8 +1185,8 @@ func TestEncodeSnapshot_HoldsMoreSubscribersThanBase64Would(t *testing.T) {
 }
 
 func TestPublishSnapshot_SendsTheCompactEncoding(t *testing.T) {
-	// Covers the write path, not just the codec. The peek fails on a cancelled
-	// context, which publishSnapshot tolerates, so the send still happens.
+	// Covers the write path, not just the codec. The cleanup peek fails on a
+	// cancelled context, so the send still counts and cleanup is left for a retry.
 	value := []byte(`{"callback_url":"https://example.com/hook","state":"active"}`)
 	sender := &fakeSender{}
 	driver, _ := mockAdmin(t, func(*http.Request) (*http.Response, error) {
@@ -1203,5 +1211,8 @@ func TestPublishSnapshot_SendsTheCompactEncoding(t *testing.T) {
 	}
 	if !bytes.Contains(sender.sent[0].Body, value) {
 		t.Fatalf("the snapshot was not sent in the compact encoding, got %s", sender.sent[0].Body)
+	}
+	if !s.cleanupPending.Load() {
+		t.Fatal("a cleanup that could not run was not left pending for a retry")
 	}
 }

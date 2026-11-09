@@ -30,6 +30,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
@@ -51,6 +52,9 @@ const (
 	compactionElectionAttemptTimeout = 10 * time.Second
 	compactionElectionRetryBase      = 3 * time.Second
 	compactionElectionRetryJitterMax = 3 * time.Second
+	// Slower because every non-leader polls every topic; a crash takeover already waits ~60 s.
+	leaderContendRetryBase      = 15 * time.Second
+	leaderContendRetryJitterMax = 15 * time.Second
 
 	snapshotPeekPage     = 50
 	snapshotCleanupBatch = 20
@@ -103,8 +107,8 @@ type compactedTopicState struct {
 	snapshotReadAt        time.Time
 	electionHoldBack      time.Duration
 	observers             []*cacheObserver
-	cleanupHWM            int64
-	cleanupPending        bool
+	cleanupPending        atomic.Bool
+	leaderAnchored        bool // election goroutine only
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -570,7 +574,7 @@ func (s *compactedTopicState) runLeaderElection(ctx context.Context) {
 				}
 				s.seedLeaderSessionBestEffort(ctx)
 			}
-			if !sleepFor(ctx, compactionElectionRetryBase+rand.N(compactionElectionRetryJitterMax)) {
+			if !sleepFor(ctx, leaderContendRetryBase+rand.N(leaderContendRetryJitterMax)) {
 				return
 			}
 			continue
@@ -805,6 +809,10 @@ func shouldSeedLeaderSession(activeCount int32, probeErr error) bool {
 // seedLeaderSessionBestEffort creates the "leader" session by sending an anchor,
 // only when the probe finds the queue empty.
 func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
+	// An anchor is never consumed, so once one is known the probe is wasted load.
+	if s.leaderAnchored {
+		return
+	}
 	probeCtx, cancelProbe := context.WithTimeout(ctx, snapshotIOTimeout)
 	props, probeErr := s.driver.home.admin.GetQueueRuntimeProperties(probeCtx, s.lockQueue, nil)
 	cancelProbe()
@@ -814,6 +822,7 @@ func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
 		active = props.ActiveMessageCount
 	}
 	if !shouldSeedLeaderSession(active, probeErr) {
+		s.leaderAnchored = true
 		slog.Debug("Leader session already anchored; not seeding",
 			"topic", s.topic, "anchors", active)
 		return
@@ -836,6 +845,7 @@ func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
 		slog.Debug("Leader-lock seed send did not complete (likely already seeded)", "topic", s.topic, "error", err)
 		return
 	}
+	s.leaderAnchored = true
 
 	// Logged because an anchor is never consumed, so every extra one stays forever.
 	slog.Info("Seeded the leader-lock session", "topic", s.topic, "probe_error", probeErr)
@@ -984,62 +994,51 @@ func (s *compactedTopicState) runLeaderLoop(
 	}
 }
 
-// recordCleanupMark stores the boundary the newest write sits above. A retry
-// reuses it instead of re-reading the queue, which by then would include that
-// write and would delete the only good state.
-func (s *compactedTopicState) recordCleanupMark(mark int64) {
-	s.mu.Lock()
-	s.cleanupHWM = mark
-	s.mu.Unlock()
-}
-
-func (s *compactedTopicState) deferCleanup() {
-	s.mu.Lock()
-	s.cleanupPending = true
-	s.mu.Unlock()
-}
-
-func (s *compactedTopicState) clearCleanup() {
-	s.mu.Lock()
-	s.cleanupPending = false
-	s.mu.Unlock()
-}
-
-// pendingCleanup reports a cleanup still owed, and the mark it must not pass.
-func (s *compactedTopicState) pendingCleanup() (bool, int64) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cleanupPending && s.cleanupHWM > 0, s.cleanupHWM
-}
-
-// retryCleanup collects what an earlier pass left behind, writing no snapshot.
+// retryCleanup finishes a cleanup an earlier write could not complete.
 func (s *compactedTopicState) retryCleanup(ctx context.Context) {
-	pending, mark := s.pendingCleanup()
-	if !pending {
+	if s.cleanupPending.Load() {
+		s.cleanupSnapshots(ctx)
+	}
+}
+
+// cleanupSnapshots deletes every snapshot older than the newest. Keeping the
+// newest is the only guard needed, so a retry is always safe.
+func (s *compactedTopicState) cleanupSnapshots(ctx context.Context) {
+	if err := s.deleteOlderSnapshots(ctx); err != nil {
+		s.cleanupPending.Store(true)
+		if ctx.Err() == nil {
+			slog.Warn("Snapshot cleanup did not finish; it will be retried", "topic", s.topic, "error", err)
+		}
 		return
 	}
+	s.cleanupPending.Store(false)
+}
 
+func (s *compactedTopicState) deleteOlderSnapshots(ctx context.Context) error {
 	peekCtx, cancel := context.WithTimeout(ctx, snapshotIOTimeout)
-	_, seqs, err := s.driver.peekSnapshotQueue(peekCtx, s.snapshotQueue)
+	newest, seqs, err := s.driver.peekSnapshotQueue(peekCtx, s.snapshotQueue)
 	cancel()
 	if err != nil {
-		if ctx.Err() == nil {
-			slog.Warn("Snapshot cleanup retry could not survey the queue", "topic", s.topic, "error", err)
-		}
-		return
+		return err
+	}
+	if newest == nil || len(seqs) <= 1 {
+		return nil
 	}
 
-	stale := 0
-	for _, seq := range seqs {
-		if seq <= mark {
-			stale++
-		}
+	receiver, err := s.driver.home.client.NewReceiverForQueue(s.snapshotQueue, &azservicebus.ReceiverOptions{
+		ReceiveMode: azservicebus.ReceiveModePeekLock,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to open the snapshot cleanup receiver: %w", err)
 	}
-	if stale == 0 {
-		s.clearCleanup()
-		return
+	defer receiver.Close(context.Background())
+
+	deleted, err := settleStaleSnapshots(ctx, receiver, *newest.SequenceNumber-1, len(seqs)-1)
+	if err != nil {
+		return err
 	}
-	s.cleanupStaleSnapshots(ctx, mark, stale)
+	slog.Debug("Collected stale snapshots", "topic", s.topic, "deleted", deleted)
+	return nil
 }
 
 // encodeSnapshot marshals the cache, writing JSON-object values as themselves
@@ -1090,15 +1089,6 @@ func (s *compactedTopicState) publishSnapshot(ctx context.Context) error {
 		return fmt.Errorf("failed to marshal snapshot: %w", err)
 	}
 
-	// Taken before the send: Sender.SendMessage reports no sequence number
-	peekCtx, cancelPeek := context.WithTimeout(ctx, snapshotIOTimeout)
-	newest, seqs, peekErr := s.driver.peekSnapshotQueue(peekCtx, s.snapshotQueue)
-	cancelPeek()
-	if peekErr != nil && ctx.Err() == nil {
-		slog.Warn("Could not survey the snapshot queue before writing; cleanup deferred",
-			"topic", s.topic, "error", peekErr)
-	}
-
 	sender, err := s.driver.home.publisher.senderFor(s.snapshotQueue)
 	if err != nil {
 		return fmt.Errorf("failed to open snapshot sender: %w", err)
@@ -1109,49 +1099,8 @@ func (s *compactedTopicState) publishSnapshot(ctx context.Context) error {
 		return fmt.Errorf("failed to send snapshot: %w", err)
 	}
 
-	if peekErr != nil {
-		s.deferCleanup()
-		return nil
-	}
-
-	var mark int64
-	if newest != nil {
-		mark = *newest.SequenceNumber
-	}
-	s.recordCleanupMark(mark)
-	s.cleanupStaleSnapshots(ctx, mark, len(seqs))
+	s.cleanupSnapshots(ctx)
 	return nil
-}
-
-// cleanupStaleSnapshots deletes up to count messages at or below mark.
-func (s *compactedTopicState) cleanupStaleSnapshots(ctx context.Context, mark int64, count int) {
-	if count == 0 || mark == 0 {
-		s.clearCleanup()
-		return
-	}
-
-	receiver, err := s.driver.home.client.NewReceiverForQueue(s.snapshotQueue, &azservicebus.ReceiverOptions{
-		ReceiveMode: azservicebus.ReceiveModePeekLock,
-	})
-	if err != nil {
-		slog.Warn("Failed to open the snapshot cleanup receiver", "topic", s.topic, "error", err)
-		s.deferCleanup()
-		return
-	}
-	defer receiver.Close(context.Background())
-
-	deleted, err := settleStaleSnapshots(ctx, receiver, mark, count)
-	switch {
-	case err != nil && ctx.Err() != nil:
-		return
-	case err != nil:
-		slog.Warn("Snapshot cleanup did not finish; it will be retried",
-			"topic", s.topic, "deleted", deleted, "expected", count, "error", err)
-		s.deferCleanup()
-	default:
-		s.clearCleanup()
-		slog.Debug("Collected stale snapshots", "topic", s.topic, "deleted", deleted)
-	}
 }
 
 // settleStaleSnapshots deletes up to count messages at or below mark, reporting
