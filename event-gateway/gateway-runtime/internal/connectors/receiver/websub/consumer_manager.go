@@ -131,6 +131,7 @@ func (cm *ConsumerManager) AddSubscription(callbackURL, secret, kafkaTopic strin
 	}
 
 	slog.Info("Consumer started for callback",
+		"broker", cm.brokerDriver.Type(),
 		"callback", callbackURL,
 		"group_id", groupID,
 		"topics", topicList,
@@ -164,7 +165,8 @@ func (cm *ConsumerManager) RemoveSubscription(callbackURL, kafkaTopic string) er
 	if deleter, ok := cm.brokerDriver.(subscriptionDeleter); ok {
 		deleteCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := deleter.DeleteSubscription(deleteCtx, groupID, kafkaTopic); err != nil {
-			slog.Error("Failed to delete broker subscription on unsubscribe", "callback", callbackURL, "topic", kafkaTopic, "error", err)
+			slog.Error("Failed to delete broker subscription on unsubscribe",
+				"broker", cm.brokerDriver.Type(), "callback", callbackURL, "topic", kafkaTopic, "error", err)
 		}
 		cancel()
 	}

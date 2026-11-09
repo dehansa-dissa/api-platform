@@ -68,7 +68,8 @@ func (p *SyncProducer) PublishSubscription(_ context.Context, sub *Subscription)
 		Value: value,
 		Topic: p.syncTopic,
 	}); err != nil {
-		slog.Error("Failed to publish subscription sync", "key", key, "error", err)
+		slog.Error("Failed to publish subscription sync",
+			"broker", p.driver.Type(), "key", key, "error", err)
 		return fmt.Errorf("failed to publish subscription sync: %w", err)
 	}
 
@@ -86,7 +87,8 @@ func (p *SyncProducer) PublishTombstone(_ context.Context, topic, callbackURL st
 		Value: nil,
 		Topic: p.syncTopic,
 	}); err != nil {
-		slog.Error("Failed to publish subscription tombstone", "key", key, "error", err)
+		slog.Error("Failed to publish subscription tombstone",
+			"broker", p.driver.Type(), "key", key, "error", err)
 		return fmt.Errorf("failed to publish subscription tombstone: %w", err)
 	}
 

@@ -137,22 +137,25 @@ func (h *HubHandler) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the Kafka topic for this channel.
+	// Resolve the broker topic for this channel.
 	kafkaTopic, ok := h.channels[topic]
 	if !ok {
-		http.Error(w, fmt.Sprintf("no kafka topic for channel: %s", topic), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("no broker topic for channel: %s", topic), http.StatusNotFound)
 		return
 	}
 
-	// Verify that the Kafka topic actually exists.
+	// Verify that the broker topic actually exists.
 	exists, err := h.brokerDriver.TopicExists(r.Context(), kafkaTopic)
 	if err != nil {
-		slog.Error("Failed to check topic existence", "topic", kafkaTopic, "error", err)
+		slog.Error("Failed to check topic existence",
+			"broker", h.brokerDriver.Type(), "topic", kafkaTopic, "error", err)
 		http.Error(w, "failed to verify topic existence", http.StatusInternalServerError)
 		return
 	}
 	if !exists {
-		http.Error(w, fmt.Sprintf("topic does not exist in broker: %s", kafkaTopic), http.StatusNotFound)
+		slog.Error("Channel maps to a broker topic that does not exist",
+			"broker", h.brokerDriver.Type(), "channel", topic, "topic", kafkaTopic)
+		http.Error(w, fmt.Sprintf("channel is not available: %s", topic), http.StatusNotFound)
 		return
 	}
 
@@ -333,7 +336,7 @@ func (h *WebhookReceiverHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 	kafkaTopic, ok := h.channels[channelName]
 	if !ok {
-		http.Error(w, fmt.Sprintf("no kafka topic for channel: %s", channelName), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("no broker topic for channel: %s", channelName), http.StatusNotFound)
 		return
 	}
 
@@ -369,7 +372,8 @@ func (h *WebhookReceiverHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := h.publishToBrokerDriver(r.Context(), kafkaTopic, processed); err != nil {
-		slog.Error("Webhook receiver publish failed", "channel", channelName, "topic", kafkaTopic, "error", err)
+		slog.Error("Webhook receiver publish failed",
+			"broker", h.brokerDriver.Type(), "channel", channelName, "topic", kafkaTopic, "error", err)
 		http.Error(w, "publish failed", http.StatusInternalServerError)
 		return
 	}
@@ -409,7 +413,8 @@ func (h *WebhookReceiverHandler) publishToBrokerDriver(ctx context.Context, kafk
 		return fmt.Errorf("failed to publish to broker-driver: %w", err)
 	}
 
-	slog.Debug("Published to broker-driver", "topic", kafkaTopic, "binding", h.bindingName)
+	slog.Debug("Published to broker-driver",
+		"broker", h.brokerDriver.Type(), "topic", kafkaTopic, "binding", h.bindingName)
 	return nil
 }
 

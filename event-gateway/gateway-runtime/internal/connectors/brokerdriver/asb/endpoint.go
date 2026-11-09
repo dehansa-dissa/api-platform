@@ -85,6 +85,10 @@ func newBrokerDriver(cfg ConnectionConfig, runtimeID string, adminOpts *admin.Cl
 	}, nil
 }
 
+var _ connectors.BrokerDriver = (*ASBBrokerDriver)(nil)
+
+func (e *ASBBrokerDriver) Type() string { return "azureservicebus" }
+
 // Publish sends a message to the given ASB topic.
 func (e *ASBBrokerDriver) Publish(ctx context.Context, topic string, msg *connectors.Message) error {
 	return e.publisher.Publish(ctx, topic, msg)

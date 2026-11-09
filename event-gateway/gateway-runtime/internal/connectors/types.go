@@ -60,6 +60,7 @@ type MessageProcessor interface {
 
 // BrokerDriver manages connections to a backend event system (e.g. Kafka, NATS).
 type BrokerDriver interface {
+	Type() string
 	Publish(ctx context.Context, topic string, msg *Message) error
 	Subscribe(groupID string, topics []string, handler MessageHandler) (Receiver, error)
 	SubscribeManual(groupID string, topics []string, handler MessageHandler) (Receiver, error)

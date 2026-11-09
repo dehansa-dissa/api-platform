@@ -516,6 +516,7 @@ func (r *flakyReceiver) Attempts() int {
 
 type testBrokerDriver struct{}
 
+func (testBrokerDriver) Type() string { return "test" }
 func (testBrokerDriver) Publish(_ context.Context, _ string, _ *connectors.Message) error {
 	return nil
 }

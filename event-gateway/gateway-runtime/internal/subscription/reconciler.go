@@ -58,7 +58,7 @@ func (r *Reconciler) SetCallback(cb SubscriptionCallback) {
 // Reconcile replays all messages from the compacted subscription topic and rebuilds the store.
 // Returns when the consumer has caught up to the high watermark.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
-	slog.Info("Starting subscription reconciliation from the broker")
+	slog.Info("Starting subscription reconciliation from the broker", "broker", r.driver.Type())
 	replayed := 0
 	err := r.driver.Replay(ctx, r.syncTopic, func(_ context.Context, msg *connectors.Message) error {
 		replayed++
@@ -88,6 +88,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("failed to replay subscriptions: %w", err)
 	}
 
-	slog.Info("Subscription reconciliation complete", "replayed", replayed, "active_subscriptions", len(r.store.GetActive()))
+	slog.Info("Subscription reconciliation complete",
+		"broker", r.driver.Type(), "replayed", replayed, "active_subscriptions", len(r.store.GetActive()))
 	return nil
 }

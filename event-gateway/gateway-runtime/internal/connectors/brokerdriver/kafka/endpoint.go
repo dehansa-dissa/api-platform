@@ -68,6 +68,10 @@ func NewBrokerDriver(cfg ConnectionConfig) (*KafkaBrokerDriver, error) {
 	}, nil
 }
 
+var _ connectors.BrokerDriver = (*KafkaBrokerDriver)(nil)
+
+func (e *KafkaBrokerDriver) Type() string { return "kafka" }
+
 // Publish sends a message to the given Kafka topic.
 func (e *KafkaBrokerDriver) Publish(ctx context.Context, topic string, msg *connectors.Message) error {
 	return e.publisher.Publish(ctx, topic, msg)

@@ -163,7 +163,7 @@ func (e *WebSubReceiver) Start(ctx context.Context) error {
 
 	if len(topicsToEnsure) > 0 {
 		if err := e.brokerDriver.EnsureTopics(ctx, topicsToEnsure, topicMetadata); err != nil {
-			return fmt.Errorf("failed to ensure broker topics: %w", err)
+			return fmt.Errorf("failed to ensure %s topics: %w", e.brokerDriver.Type(), err)
 		}
 	}
 
@@ -172,7 +172,8 @@ func (e *WebSubReceiver) Start(ctx context.Context) error {
 	// Ensure the subscription sync topic exists before producing or reconciling.
 	if e.syncProducer != nil {
 		if err := e.syncProducer.EnsureSyncTopic(ctx); err != nil {
-			slog.Warn("Failed to ensure subscription sync topic", "error", err)
+			slog.Warn("Failed to ensure subscription sync topic",
+				"broker", e.brokerDriver.Type(), "error", err)
 		}
 	}
 
