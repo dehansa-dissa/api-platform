@@ -52,21 +52,17 @@ const (
 	// Each poll is a peek against a cloud broker, so this is deliberately not tight.
 	snapshotPollInterval = 2 * time.Second
 
-	// snapshotPeekCount matches the driver's own peek depth. Normally the queue
-	// holds exactly one message; more means a previous cleanup failed, and the
-	// newest by sequence number wins.
-	snapshotPeekCount = 10
+	// snapshotPeekPage matches the driver's page size. More than one message
+	// means a cleanup failed, and the newest by sequence number wins.
+	snapshotPeekPage = 50
 
-	// defaultITRuntimeID mirrors the APIP_EGW_RUNTIME_ID default in
-	// docker-compose.test.asb.yaml. The driver names its live-tail subscription
-	// from this, so the two must agree or the self-heal assertions look at a
-	// subscription nobody owns.
+	// defaultITRuntimeID mirrors the compose default. The driver names its
+	// live-tail subscription from it, so the two must agree.
 	defaultITRuntimeID = "egw-it-asb"
 )
 
-// cacheSubscriptionName mirrors the driver's naming for the per-instance
-// live-tail subscription: "cache-" plus the first 16 hex characters of the
-// runtime ID's SHA-256, which keeps it inside ASB's 50-character limit.
+// cacheSubscriptionName mirrors the driver: "cache-" plus 16 hex characters of
+// the runtime ID's SHA-256, keeping it inside ASB's 50-character limit.
 func cacheSubscriptionName(runtimeID string) string {
 	sum := sha256.Sum256([]byte(runtimeID))
 	return "cache-" + fmt.Sprintf("%x", sum)[:16]
@@ -100,17 +96,13 @@ func subscriptionExists(ctx context.Context, client *admin.Client, topic, subscr
 		}
 		return false, err
 	}
-	// The SDK maps a 404 to (nil, nil), so a missing subscription arrives as a
-	// nil response with no error. Checking err alone reports everything as
-	// present — which is exactly how this assertion first passed against a
-	// subscription that did not exist.
+	// The SDK maps a 404 to (nil, nil), so checking err alone reports everything
+	// as present — how this first passed against a subscription that was gone.
 	return resp != nil, nil
 }
 
-// isASBNotFound matches the shapes Service Bus reports a missing entity in.
-// The management API answers HTTP 404; the SDK also wraps it as CodeNotFound.
-// A receiver detaching reports a third, bare *amqp.Error shape, but that only
-// reaches the driver, never these management calls.
+// isASBNotFound matches the two shapes a management call reports a missing
+// entity in. The driver's third, bare *amqp.Error, never reaches here.
 func isASBNotFound(err error) bool {
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
@@ -120,16 +112,8 @@ func isASBNotFound(err error) bool {
 	return errors.As(err, &sbErr) && sbErr.Code == azservicebus.CodeNotFound
 }
 
-// syncTopicName derives an API's internal subscription sync topic.
-//
-// Reimplemented rather than imported: the production functions live in
-// gateway-runtime's internal/binding, and Go's internal rule puts them out of
-// reach of this module. TestSyncTopicName_MatchesProductionHash pins the result
-// against a hash observed in a real run, so a change to the convention breaks
-// the unit test rather than silently making these assertions read the wrong
-// queue.
-//
-// apiName is the metadata name ("asb-restart-v1-0"), not the display name.
+// syncTopicName derives an API's sync topic from its metadata name, not its
+// display name. Reimplemented because binding's version sits under internal/.
 func syncTopicName(apiName, version string) string {
 	return joinNormalizedTopic(apiName, version, subscriptionTopicSuffix)
 }
@@ -144,12 +128,8 @@ func joinNormalizedTopic(parts ...string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(joined.String())))
 }
 
-// countSnapshotSubscribers peeks the snapshot queue for a sync topic and
-// returns how many subscribers the latest snapshot holds.
-//
-// Peek, never receive: the driver's own Replay peeks too, and a consuming read
-// here would delete the state the gateway depends on — the test would corrupt
-// what it is measuring.
+// countSnapshotSubscribers peeks the snapshot queue and returns how many
+// subscribers it holds. Peek, never receive: a consuming read would delete it.
 func countSnapshotSubscribers(ctx context.Context, connectionString, syncTopic string) (int, error) {
 	client, err := azservicebus.NewClientFromConnectionString(connectionString, nil)
 	if err != nil {
@@ -163,41 +143,53 @@ func countSnapshotSubscribers(ctx context.Context, connectionString, syncTopic s
 	}
 	defer receiver.Close(context.Background())
 
-	messages, err := receiver.PeekMessages(ctx, snapshotPeekCount, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to peek snapshot: %w", err)
+	// Paged like the driver. Peek starts at the queue head, so a single window
+	// would miss the newest message outright once a failed cleanup leaves more
+	// copies than the window holds — the very state this step exists to catch.
+	var newest *azservicebus.ReceivedMessage
+	var from int64
+	for paging := false; ; paging = true {
+		opts := &azservicebus.PeekMessagesOptions{}
+		if paging {
+			opts.FromSequenceNumber = &from
+		}
+		batch, err := receiver.PeekMessages(ctx, snapshotPeekPage, opts)
+		if err != nil {
+			return 0, fmt.Errorf("failed to peek snapshot: %w", err)
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, msg := range batch {
+			if msg.SequenceNumber == nil {
+				continue
+			}
+			if newest == nil || *msg.SequenceNumber > *newest.SequenceNumber {
+				newest = msg
+			}
+			from = *msg.SequenceNumber + 1
+		}
 	}
-	if len(messages) == 0 {
+	if newest == nil {
 		return 0, nil // no snapshot written yet
 	}
 
-	newest := messages[0]
-	for _, msg := range messages[1:] {
-		if msg.SequenceNumber != nil && (newest.SequenceNumber == nil || *msg.SequenceNumber > *newest.SequenceNumber) {
-			newest = msg
-		}
-	}
-
-	var snapshot map[string][]byte
+	// RawMessage, not []byte: the driver writes a value that is already a JSON
+	// object verbatim rather than base64-encoding it, and only the count matters
+	// here, so neither shape has to be decoded further.
+	var snapshot map[string]json.RawMessage
 	if err := json.Unmarshal(newest.Body, &snapshot); err != nil {
 		return 0, fmt.Errorf("failed to decode snapshot payload: %w", err)
 	}
 	return len(snapshot), nil
 }
 
-// RegisterASBSteps registers steps that only the Azure Service Bus feature
-// needs. They are broker-agnostic in form — restarting the gateway means the
-// same thing on Kafka — but they exist because ASB is the only driver whose
-// correctness depends on surviving one.
-//
-// compose is passed in rather than read from a package variable: the manager is
-// created in suite_test.go, which the non-test files in this package cannot
-// reference.
+// RegisterASBSteps registers the steps only the Service Bus feature needs.
+// compose is passed in because it is created in suite_test.go, which the
+// non-test files here cannot reference.
 func RegisterASBSteps(ctx *godog.ScenarioContext, compose *ComposeManager) {
-	// Proves subscriber state is rebuilt from the snapshot queue rather than
-	// held in memory. Service Bus deletes consumed messages and a new
-	// Subscription never receives anything published before it existed, so
-	// without the snapshot a restart would lose every subscriber.
+	// Proves subscriber state is rebuilt from the snapshot rather than held in
+	// memory: ASB has nothing to replay, so a restart would otherwise lose it.
 	ctx.Step(`^I restart the event gateway$`, func() error {
 		if compose == nil {
 			return fmt.Errorf("compose manager unavailable: the suite must be started through TestFeatures")
@@ -205,11 +197,8 @@ func RegisterASBSteps(ctx *godog.ScenarioContext, compose *ComposeManager) {
 		return compose.RestartService(context.Background(), gatewayServiceName)
 	})
 
-	// Replaces sleeping before a restart. A subscribe is durable only once the
-	// leader has written it to the snapshot queue, and that lands well after the
-	// hub returns 202: the change must round-trip the sync topic, reach the
-	// leader's cache, and clear a debounce. Restarting before then loses it, so
-	// this waits on the condition rather than guessing at the delay.
+	// A subscribe is durable only once the leader has written it out, well after
+	// the 202. Waits on that condition rather than guessing at a delay.
 	ctx.Step(`^the ASB snapshot for API "([^"]*)" version "([^"]*)" should contain (\d+) subscribers within (\d+) seconds$`,
 		func(apiName, version string, want, timeoutSeconds int) error {
 			connectionString := os.Getenv("APIP_EGW_ASB_CONNECTION_STRING")
@@ -243,13 +232,9 @@ func RegisterASBSteps(ctx *godog.ScenarioContext, compose *ComposeManager) {
 				apiName, version, syncTopic, lastCount, timeoutSeconds, want)
 		})
 
-	// Deleting the live-tail subscription simulates what AutoDeleteOnIdle does
-	// to an instance that has been quiet, and what an operator does by hand in
-	// the portal. The driver is supposed to notice the 404 and rebuild.
-	//
-	// Worth testing rather than trusting: the recovery keys off isNotFoundErr,
-	// which shipped twice matching only error shapes this path never produces,
-	// so the healing had never once run.
+	// Simulates AutoDeleteOnIdle reclaiming a quiet instance's subscription, or
+	// an operator deleting it. Worth testing: the recovery keys off
+	// isNotFoundErr, which shipped twice matching the wrong shapes.
 	ctx.Step(`^I delete the ASB cache subscription for API "([^"]*)" version "([^"]*)"$`,
 		func(apiName, version string) error {
 			client, err := asbAdmin()

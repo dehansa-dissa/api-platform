@@ -55,10 +55,8 @@ func registryWith(channels ...string) *TopicRegistry {
 	return r
 }
 
-// A response body is read by the subscriber, who has no way to know or care
-// which broker the deployment runs. Naming one there was wrong on ASB and
-// would be wrong again for any driver added later, so these assert the
-// absence of every driver name rather than the presence of one wording.
+// A subscriber can't know or act on which broker the deployment runs, so these
+// assert that no response names any driver.
 var driverNames = []string{"kafka", "azureservicebus", "servicebus"}
 
 func assertNamesNoBroker(t *testing.T, body string) {
@@ -109,8 +107,8 @@ func TestWebhookReceiver_UnmappedChannelDoesNotNameTheBroker(t *testing.T) {
 	assertNamesNoBroker(t, rec.Body.String())
 }
 
-// The channel name comes from the caller, so it must still be echoed — the fix
-// removed the broker's name, not the caller's own input.
+// The channel name comes from the caller, so it is still echoed; only the
+// broker's name is left out.
 func TestHubSubscribe_UnmappedChannelStillEchoesTheChannel(t *testing.T) {
 	h := &HubHandler{
 		topics:    registryWith("loginSuccess"),
@@ -157,9 +155,8 @@ func (stubDriver) DeleteTopics(context.Context, []string) error       { return n
 func (stubDriver) Close() error                                       { return nil }
 
 func TestHubSubscribe_MissingBrokerTopicDoesNotEchoTheTopicHash(t *testing.T) {
-	// The broker topic is a SHA-256 this gateway derives. Echoing it discloses how
-	// topics are named and tells a subscriber nothing they can act on, so the
-	// response names the channel they asked for instead.
+	// The broker topic is an internal SHA-256 that tells a subscriber nothing, so
+	// the response names the channel they asked for instead.
 	const topicHash = "9b20e5d2847060d60712b7e8858cb7a8c3fa638fa4fc443cccb8d6cc1daaef99"
 	h := &HubHandler{
 		topics:       registryWith("loginSuccess"),

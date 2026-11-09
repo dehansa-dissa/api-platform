@@ -20,14 +20,8 @@ package it
 
 import "testing"
 
-// TestSyncTopicName_MatchesProductionHash guards the one thing syncTopicName
-// can get wrong without failing loudly: reading a queue that exists but belongs
-// to nothing, which reports zero subscribers and looks like a driver bug.
-//
-// The expected hash was taken from a live run — the sync topic the gateway
-// itself created for the asb-restart scenario. It pins both the hashing scheme
-// and the arguments: the API's metadata name, not its display name, and the
-// spec version.
+// Guards the quiet failure: reading a queue belonging to nothing reports zero
+// subscribers and looks like a driver bug. The hash is from a live run.
 func TestSyncTopicName_MatchesProductionHash(t *testing.T) {
 	const (
 		apiName = "asb-restart-v1-0"
@@ -42,19 +36,16 @@ func TestSyncTopicName_MatchesProductionHash(t *testing.T) {
 	}
 }
 
-// TestJoinNormalizedTopic_LengthPrefixPreventsCollision covers why the parts
-// are length-prefixed rather than concatenated: without it, ("ab", "c") and
-// ("a", "bc") would hash identically.
+// Covers why parts are length-prefixed: without it ("ab", "c") and ("a", "bc")
+// would hash identically.
 func TestJoinNormalizedTopic_LengthPrefixPreventsCollision(t *testing.T) {
 	if joinNormalizedTopic("ab", "c") == joinNormalizedTopic("a", "bc") {
 		t.Fatal("parts that regroup across a boundary must not produce the same topic")
 	}
 }
 
-// TestCacheSubscriptionName_MatchesDriverNaming pins the derivation against the
-// driver's cacheSubscriptionName. A drifting copy would delete or poll a
-// subscription nobody owns, and the self-heal scenario would pass or fail for
-// reasons unrelated to the driver.
+// Pins the derivation against the driver's. A drifting copy would poll a
+// subscription nobody owns, passing or failing for unrelated reasons.
 func TestCacheSubscriptionName_MatchesDriverNaming(t *testing.T) {
 	// "cache-" + first 16 hex chars of SHA-256("egw-it-asb"), the runtime ID
 	// docker-compose.test.asb.yaml pins.
@@ -69,9 +60,8 @@ func TestCacheSubscriptionName_MatchesDriverNaming(t *testing.T) {
 	}
 }
 
-// TestITRuntimeID_DefaultsToTheComposeValue guards the other half: the test and
-// the gateway must agree on the identity, or the name is right and the owner is
-// wrong.
+// The other half: test and gateway must agree on the identity, or the name is
+// right and the owner is wrong.
 func TestITRuntimeID_DefaultsToTheComposeValue(t *testing.T) {
 	t.Setenv("APIP_EGW_RUNTIME_ID", "")
 	if got := itRuntimeID(); got != defaultITRuntimeID {

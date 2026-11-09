@@ -70,15 +70,11 @@ services:
       - "9002:9002"   # Admin API
       - "9003:9003"   # Metrics
     environment:
-      # Placeholder only, never dialled: validateKafkaConfig runs unconditionally
-      # at startup and rejects an empty broker list, so an ASB-only deployment
-      # must still name one. 
       - APIP_EGW_KAFKA_BROKERS=unused.invalid:9092
 
-      # The namespace comes from the host environment and is never written to a
-      # file in this repository.
       - APIP_EGW_ASB_CONNECTION_STRING=${APIP_EGW_ASB_CONNECTION_STRING:?set APIP_EGW_ASB_CONNECTION_STRING before running the ASB stack}
       - APIP_EGW_ASB_SUBSCRIPTION_IDLE_TIMEOUT_SECONDS=300
+      - APIP_EGW_ASB_MAX_DELIVERY_COUNT=30
 
       - APIP_EGW_RUNTIME_ID=${APIP_EGW_RUNTIME_ID:-egw-it-asb}
 
@@ -97,7 +93,6 @@ services:
     volumes:
       - ../gateway/gateway-controller/listener-certs:/etc/event-gateway/tls:ro
       - ./gateway-runtime/configs/config.toml:/etc/event-gateway/config.toml:ro
-      # An empty binding set, not the developer's working copy — see the file.
       - ./it/asb-channels.yaml:/etc/event-gateway/channels.yaml:ro
     depends_on:
       gateway-controller:

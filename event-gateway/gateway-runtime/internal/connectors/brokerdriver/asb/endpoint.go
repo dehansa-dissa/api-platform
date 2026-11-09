@@ -215,6 +215,19 @@ func isConflictErr(err error) bool {
 	return errors.As(err, &respErr) && respErr.StatusCode == http.StatusConflict
 }
 
+// sessionCannotBeLocked is what Service Bus returns when a session exists but
+// another receiver holds it. The SDK has no Code for it, so the AMQP condition
+// is matched directly.
+const sessionCannotBeLocked = "com.microsoft:session-cannot-be-locked"
+
+// isSessionHeldErr reports that the leader session is held elsewhere — the
+// steady state for every instance that is not the leader, and proof the session
+// already exists.
+func isSessionHeldErr(err error) bool {
+	var amqpErr *amqp.Error
+	return errors.As(err, &amqpErr) && string(amqpErr.Condition) == sessionCannotBeLocked
+}
+
 // isNotFoundErr matches all three shapes the SDK delivers: HTTP 404, CodeNotFound,
 // and a bare *amqp.Error. The receive loops self-heal off this.
 func isNotFoundErr(err error) bool {

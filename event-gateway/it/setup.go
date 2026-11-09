@@ -45,9 +45,8 @@ const (
 	// HealthCheckInterval is how often to poll service health endpoints.
 	HealthCheckInterval = 2 * time.Second
 
-	// ServiceStopTimeout bounds how long a service gets to exit on its own
-	// before Docker kills it. Long enough to stay graceful: a broker driver may
-	// have shutdown work to finish, and a kill would skip it.
+	// ServiceStopTimeout bounds a graceful exit before Docker kills the
+	// container. A killed broker driver skips its shutdown work.
 	ServiceStopTimeout = 30 * time.Second
 )
 
@@ -181,13 +180,8 @@ func (cm *ComposeManager) WaitForHealthy(ctx context.Context) error {
 	}
 }
 
-// RestartService stops one compose service and starts it again, returning once
-// the stack reports healthy. The container keeps its volumes and network, so
-// only the process is replaced.
-//
-// The stop is graceful on purpose. A killed gateway skips its shutdown work,
-// and for the ASB driver that work is the point: the final snapshot flush is
-// what a restart scenario is written to prove.
+// RestartService stops and starts one compose service, returning once healthy.
+// Graceful on purpose: a kill would skip the driver's final snapshot flush.
 func (cm *ComposeManager) RestartService(ctx context.Context, service string) error {
 	container, err := cm.compose.ServiceContainer(ctx, service)
 	if err != nil {

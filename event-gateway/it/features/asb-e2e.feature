@@ -16,14 +16,9 @@
 # under the License.
 # --------------------------------------------------------------------
 
-# Runs only against docker-compose.test.asb.yaml, which needs
-# APIP_EGW_ASB_CONNECTION_STRING in the environment. See it/Makefile target
-# test-asb.
-#
-# Waits are longer than the Kafka equivalents on purpose. Every entity
-# operation here is an Azure management API round trip, and a subscribe
-# reaches the driver's cache only after its sync message travels out to the
-# broker and back — measured at roughly four seconds against a live namespace.
+# Runs only against docker-compose.test.asb.yaml; see the test-asb make target.
+# Waits are longer than the Kafka equivalents because every entity operation is
+# an Azure management round trip.
 
 @asb
 Feature: Azure Service Bus End-to-End Flow
@@ -236,9 +231,8 @@ Feature: Azure Service Bus End-to-End Flow
     Then the response status code should be 202
     And I wait for 5 seconds
 
-    # The driver deletes the subscriber's ASB Subscription here — Kafka has no
-    # equivalent entity, which is why DeleteSubscription sits outside the
-    # BrokerDriver interface and is reached by an optional type assertion.
+    # The driver deletes the subscriber's Subscription here. Kafka has no such
+    # entity, so DeleteSubscription sits outside the BrokerDriver interface.
     When I unsubscribe from topic "news" on API "asb-unsub" version "v1.0" with callback "http://wh-listener:8090/"
     Then the response status code should be 202
 
@@ -247,83 +241,66 @@ Feature: Azure Service Bus End-to-End Flow
     When I delete the WebSub API "asb-unsub-v1-0"
     Then the response should be successful
 
-  # ==================== RESTART RECOVERY — DISABLED ====================
-  #
-  # The scenario this driver exists for, and it currently fails for a reason
-  # outside the driver: the hub route is registered in NewReceiver, but Start()
-  # takes several seconds on ASB to create the sync topic and its subscriptions.
-  # A subscribe accepted in that window is published to the sync topic before
-  # anything is subscribed to it, and Service Bus never delivers a message sent
-  # before a Subscription existed — so the record is lost silently.
-  #
-  # Six scenarios above pass regardless, because delivery uses the in-memory
-  # consumer and never reads the sync topic. Only durability does.
-  #
-  # Fixing it means changing shared WebSub code, so it is deferred pending a
-  # decision. Re-enable this scenario to verify the fix — the snapshot
-  # assertion it uses is implemented and unit-tested.
-  #
-  #
-  # # The scenario this driver exists for. Service Bus deletes consumed messages
-  # # and a new Subscription never receives anything published before it existed,
-  # # so subscriber state is rebuilt from a snapshot queue guarded by leader
-  # # election. Nothing above proves that; this does.
-  #
-  # Scenario: A subscription survives a gateway restart
-  # Given I authenticate using basic auth as "admin"
-  # When I create a WebSub API with the following configuration:
-  # """
-  # {
-  # "apiVersion": "gateway.api-platform.wso2.com/v1",
-  # "kind": "WebSubApi",
-  # "metadata": { "name": "asb-restart-v1-0" },
-  # "spec": {
-  # "displayName": "asb-restart",
-  # "version": "v1.0",
-  # "context": "/asb-restart",
-  # "channels": { "issues": {} },
-  # "broker": { "type": "azureservicebus" },
-  # "deploymentState": "deployed"
-  # }
-  # }
-  # """
-  # Then the response should be successful
-  # And the WebSub API "asb-restart" version "v1.0" is reachable within 30 seconds
-  #
-  # When I subscribe to topic "issues" on API "asb-restart" version "v1.0" with callback "http://wh-listener:8090/"
-  # Then the response status code should be 202
-  #
-  # # Restarting before the snapshot is written loses the subscriber, so wait on
-  # # the condition rather than guessing at the delay. Measured between 3 and
-  # # 12 seconds against a live namespace, which is why a fixed sleep here was
-  # # flaky in both directions.
-  # Then the ASB snapshot for API "asb-restart-v1-0" version "v1.0" should contain 1 subscribers within 60 seconds
-  #
-  # When I restart the event gateway
-  # And the WebSub API "asb-restart" version "v1.0" is reachable within 60 seconds
-  #
-  # # Nobody re-subscribed. If this delivers, the subscriber list came back
-  # # from the snapshot queue.
-  # When I publish event "asb-survived-restart" to topic "issues" on API "asb-restart" version "v1.0"
-  # Then the response status code should be 202
-  # And I wait for event delivery for 15 seconds
-  # Then the webhook listener should have received the event "asb-survived-restart"
-  #
-  # # Cleanup
-  # Given I authenticate using basic auth as "admin"
-  # When I delete the WebSub API "asb-restart-v1-0"
-  # Then the response should be successful
-  #
+  # ==================== RESTART RECOVERY ====================
+
+  # The one behaviour ASB cannot inherit from Kafka: there is nothing to replay,
+  # so surviving a restart depends entirely on the snapshot queue.
+  Scenario: A subscription survives a gateway restart
+    Given I authenticate using basic auth as "admin"
+    When I create a WebSub API with the following configuration:
+      """
+      {
+        "apiVersion": "gateway.api-platform.wso2.com/v1",
+        "kind": "WebSubApi",
+        "metadata": { "name": "asb-restart-v1-0" },
+        "spec": {
+          "displayName": "asb-restart",
+          "version": "v1.0",
+          "context": "/asb-restart",
+          "channels": { "issues": {} },
+          "broker": { "type": "azureservicebus" },
+          "deploymentState": "deployed"
+        }
+      }
+      """
+    Then the response should be successful
+    And the WebSub API "asb-restart" version "v1.0" is reachable within 30 seconds
+
+    # The route answers before Start() finishes provisioning, and a subscribe in
+    # that window reaches the sync topic with nothing subscribed to it yet. The
+    # cache subscription is that subscriber, so its existence closes the window.
+    And the ASB cache subscription for API "asb-restart-v1-0" version "v1.0" should exist within 30 seconds
+
+    When I subscribe to topic "issues" on API "asb-restart" version "v1.0" with callback "http://wh-listener:8090/"
+    Then the response status code should be 202
+
+    # Restarting before the snapshot is written loses the subscriber, so wait on
+    # the condition rather than a fixed sleep, which was flaky both ways.
+    Then the ASB snapshot for API "asb-restart-v1-0" version "v1.0" should contain 1 subscribers within 60 seconds
+
+    When I restart the event gateway
+    And the WebSub API "asb-restart" version "v1.0" is reachable within 60 seconds
+
+    # Replay runs inside Start(), behind the route as above. Nothing observable
+    # marks it done, so this is a timing assumption rather than a condition.
+    And I wait for 15 seconds
+
+    # Nobody re-subscribed. If this delivers, the subscriber list came back
+    # from the snapshot queue.
+    When I publish event "asb-survived-restart" to topic "issues" on API "asb-restart" version "v1.0"
+    Then the response status code should be 202
+    And I wait for event delivery for 15 seconds
+    Then the webhook listener should have received the event "asb-survived-restart"
+
+    # Cleanup
+    Given I authenticate using basic auth as "admin"
+    When I delete the WebSub API "asb-restart-v1-0"
+    Then the response should be successful
 
   # ==================== SELF-HEALING ====================
 
-  # The driver creates a per-instance live-tail subscription to keep its cache
-  # current. Azure reclaims it after an idle period, and an operator can delete
-  # it by hand, so the driver must notice and rebuild — silently losing the tail
-  # would leave the snapshot frozen with no error anywhere.
-  #
-  # Deliberately does not subscribe: this exercises the recovery path alone,
-  # independent of subscription state.
+  # Azure reclaims the per-instance live-tail subscription when idle, and losing
+  # it silently would freeze the snapshot. Does not subscribe: recovery only.
   Scenario: The live-tail subscription is rebuilt after being deleted
     Given I authenticate using basic auth as "admin"
     When I create a WebSub API with the following configuration:
@@ -352,4 +329,63 @@ Feature: Azure Service Bus End-to-End Flow
     # Cleanup
     Given I authenticate using basic auth as "admin"
     When I delete the WebSub API "asb-heal-v1-0"
+    Then the response should be successful
+
+
+  # ==================== WEBBROKER ====================
+
+  # The other half of the scope: Subscribe, Publish and EnsureTopics through the
+  # websocket receiver, which the WebSub scenarios never touch.
+  Scenario: A WebBroker API can expose Service Bus over WebSocket
+    Given I authenticate using basic auth as "admin"
+    When I create a WebBroker API with the following configuration:
+      """
+      {
+        "apiVersion": "gateway.api-platform.wso2.com/v1",
+        "kind": "WebBrokerApi",
+        "metadata": { "name": "asb-broker-echo-v1.0" },
+        "spec": {
+          "displayName": "ASB Broker Echo API",
+          "version": "v1.0",
+          "context": "/asb-broker-echo/v1.0",
+          "receiver": { "name": "websocket-receiver", "type": "websocket" },
+          "broker": {
+            "name": "asb-driver",
+            "type": "azureservicebus"
+          },
+          "allChannels": {
+            "on_connection_init": { "policies": [] },
+            "on_produce": { "policies": [] },
+            "on_consume": { "policies": [] }
+          },
+          "channels": {
+            "asbecho": {
+              "on_connection_init": { "policies": [] },
+              "on_produce": { "policies": [] },
+              "on_consume": { "policies": [] }
+            }
+          }
+        }
+      }
+      """
+    Then the response should be successful
+    And the WebBroker API at "/asb-broker-echo/v1.0" is reachable within 30 seconds
+
+    # The route answers before Start() creates the topic, so connecting early
+    # fails to build its consumer.
+    And I wait for 10 seconds
+
+    When I connect to WebBroker API "/asb-broker-echo/v1.0" on channel "asbecho"
+
+    # Longer than Kafka's 1 second: ASB never delivers a message published
+    # before the Subscription existed.
+    And I wait for 5 seconds
+    And I send WebSocket message "asb-echo-hello"
+    Then I should receive a WebSocket message containing "asb-echo-hello" within 15 seconds
+
+    When I close the WebSocket connection
+
+    # Cleanup
+    Given I authenticate using basic auth as "admin"
+    When I delete the WebBroker API "asb-broker-echo-v1.0"
     Then the response should be successful

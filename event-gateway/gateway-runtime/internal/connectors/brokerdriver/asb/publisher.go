@@ -20,12 +20,15 @@ package asb
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
@@ -45,10 +48,12 @@ var _ messageSender = (*azservicebus.Sender)(nil)
 // Application-property keys for connectors.Message fields with no native ASB
 // equivalent. ASB has no Kafka-style tombstone, so it is encoded explicitly.
 const (
-	applyPropertyTombstone = "x-eventgateway-tombstone"
-	applyPropertyKey       = "x-eventgateway-key"
-	applyPropertyHeaders   = "x-eventgateway-headers"
+	applicationPropertyTombstone = "x-eventgateway-tombstone"
+	applicationPropertyKey       = "x-eventgateway-key"
+	applicationPropertyHeaders   = "x-eventgateway-headers"
 )
+
+const maxMessageIDLength = 128
 
 // Publisher publishes events to Azure Service Bus topics. An ASB sender is
 // bound to one entity, so senders are cached per topic or queue and reused.
@@ -137,15 +142,14 @@ func toServiceBusMessage(msg *connectors.Message) (*azservicebus.Message, error)
 	}
 
 	if msg.Value == nil {
-		sbMsg.ApplicationProperties[applyPropertyTombstone] = true
+		sbMsg.ApplicationProperties[applicationPropertyTombstone] = true
 	} else {
 		sbMsg.Body = msg.Value
 	}
 
 	if len(msg.Key) > 0 {
-		sbMsg.ApplicationProperties[applyPropertyKey] = base64.StdEncoding.EncodeToString(msg.Key)
-		keyStr := string(msg.Key)
-		sbMsg.MessageID = &keyStr
+		sbMsg.ApplicationProperties[applicationPropertyKey] = base64.StdEncoding.EncodeToString(msg.Key)
+		sbMsg.MessageID = to.Ptr(messageIDForKey(msg.Key))
 	}
 
 	if len(msg.Headers) > 0 {
@@ -153,8 +157,18 @@ func toServiceBusMessage(msg *connectors.Message) (*azservicebus.Message, error)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal message headers: %w", err)
 		}
-		sbMsg.ApplicationProperties[applyPropertyHeaders] = string(headerBytes)
+		sbMsg.ApplicationProperties[applicationPropertyHeaders] = string(headerBytes)
 	}
 
 	return sbMsg, nil
+}
+
+// messageIDForKey renders a subscription key as a message ID Service Bus will
+// accept.
+func messageIDForKey(key []byte) string {
+	if len(key) <= maxMessageIDLength {
+		return string(key)
+	}
+	sum := sha256.Sum256(key)
+	return hex.EncodeToString(sum[:])
 }

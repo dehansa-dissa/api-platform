@@ -1,8 +1,15 @@
 package asb
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -64,33 +71,6 @@ func TestCacheSubscriptionName_DeterministicAndBounded(t *testing.T) {
 	}
 }
 
-func TestSyncSubscriptionName_BoundedForRealisticConsumerID(t *testing.T) {
-	consumerID := "3f8a1c72-9b4e-4d21-a5f6-7e0c1d2b3a49-1c2f3a4b5c6d"
-	if len("sync-"+consumerID) <= maxSubscriptionNameLength {
-		t.Fatalf("test premise broken: unhashed name is only %d chars, expected it to exceed %d",
-			len("sync-"+consumerID), maxSubscriptionNameLength)
-	}
-
-	assertValidSubscriptionName(t, "syncSubscriptionName()", syncSubscriptionName(consumerID))
-}
-
-func TestSyncSubscriptionName_DeterministicAndDistinct(t *testing.T) {
-	a := syncSubscriptionName("runtime-1-api-a")
-	if a != syncSubscriptionName("runtime-1-api-a") {
-		t.Fatal("syncSubscriptionName must be deterministic for the same consumerID")
-	}
-	if a == syncSubscriptionName("runtime-1-api-b") {
-		t.Fatal("syncSubscriptionName should differ across distinct consumerIDs")
-	}
-}
-
-func TestSyncAndCacheSubscriptionNames_NeverCollide(t *testing.T) {
-	id := "runtime-instance-1"
-	if syncSubscriptionName(id) == cacheSubscriptionName(id) {
-		t.Fatal("sync and cache subscription names must never collide for the same identity")
-	}
-}
-
 func TestSubscriptionNames_BoundedRegardlessOfInputLength(t *testing.T) {
 	longID := ""
 	for i := 0; i < 500; i++ {
@@ -98,7 +78,6 @@ func TestSubscriptionNames_BoundedRegardlessOfInputLength(t *testing.T) {
 	}
 	for name, got := range map[string]string{
 		"cacheSubscriptionName": cacheSubscriptionName(longID),
-		"syncSubscriptionName":  syncSubscriptionName(longID),
 	} {
 		assertValidSubscriptionName(t, name+"() with a long input", got)
 	}
@@ -266,6 +245,8 @@ func (p *publishRecorder) count() int {
 
 func neverFails(context.Context) error { return nil }
 
+func noReconcile(context.Context) {}
+
 func TestLeaderLoop_PublishesPromptlyOnCacheChange(t *testing.T) {
 	s := newTestCompactedState()
 	rec := newPublishRecorder()
@@ -276,7 +257,7 @@ func TestLeaderLoop_PublishesPromptlyOnCacheChange(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, testLeaderTimings(), neverFails, rec.publish)
+		s.runLeaderLoop(ctx, testLeaderTimings(), neverFails, rec.publish, noReconcile)
 	}()
 
 	s.applyToCache(&connectors.Message{Key: []byte("topic:cb"), Value: []byte("v")})
@@ -303,7 +284,7 @@ func TestLeaderLoop_PublishesChangeThatPredatesLeadership(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, testLeaderTimings(), neverFails, rec.publish)
+		s.runLeaderLoop(ctx, testLeaderTimings(), neverFails, rec.publish, noReconcile)
 	}()
 
 	select {
@@ -329,7 +310,7 @@ func TestLeaderLoop_CoalescesBurstIntoFewWrites(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish, noReconcile)
 	}()
 
 	const changes = 100
@@ -425,7 +406,7 @@ func TestLeaderLoop_KeepsLeadershipThroughTransientRenewalFailure(t *testing.T) 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, timings, renew, neverFails)
+		s.runLeaderLoop(ctx, timings, renew, neverFails, noReconcile)
 	}()
 
 	select {
@@ -450,6 +431,7 @@ func TestLeaderLoop_StepsDownWhenLockRenewalFails(t *testing.T) {
 		s.runLeaderLoop(context.Background(), timings,
 			func(context.Context) error { return errors.New("lock lost") },
 			neverFails,
+			noReconcile,
 		)
 	}()
 
@@ -477,7 +459,7 @@ func TestLeaderLoop_SurvivesPublishFailure(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish, noReconcile)
 	}()
 
 	select {
@@ -508,7 +490,7 @@ func TestLeaderLoop_ReturnsOnContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, testLeaderTimings(), neverFails, neverFails)
+		s.runLeaderLoop(ctx, testLeaderTimings(), neverFails, neverFails, noReconcile)
 	}()
 
 	cancel()
@@ -531,7 +513,7 @@ func TestLeaderLoop_ReturnsWhenCancelledDuringDebounce(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish, noReconcile)
 	}()
 
 	s.applyToCache(&connectors.Message{Key: []byte("k"), Value: []byte("v")})
@@ -549,22 +531,37 @@ func TestLeaderLoop_ReturnsWhenCancelledDuringDebounce(t *testing.T) {
 	}
 }
 
-func TestRunLeaderElection_RefusesLeadershipWhenCacheIsUnseeded(t *testing.T) {
+func TestRunLeaderElection_WaitsRatherThanContendingWhileUnseeded(t *testing.T) {
+	// A snapshot written from an unseeded cache erases every subscriber this
+	// instance never saw, so it must not contend. The driver is nil, so contending
+	// would panic — surviving is the proof it did not.
+	//
+	// It waits rather than returning: the live tail retries seeding, and an
+	// instance that gave up here stayed demoted for the life of the process, which
+	// on a single-instance deployment means no snapshot is ever written again.
 	s := newTestCompactedState()
 	if s.seeded {
 		t.Fatal("test premise broken: expected a fresh state to be unseeded")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderElection(context.Background())
+		s.runLeaderElection(ctx)
 	}()
 
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("unseeded instance contended for leadership; it would overwrite the snapshot with a partial cache")
+		t.Fatal("stopped waiting while unseeded; a seed completing later could never promote this instance")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("waiting for a seed ignored cancellation; shutdown would block")
 	}
 }
 
@@ -579,7 +576,7 @@ func TestLeaderLoop_SkipsIntervalPublishWhenNothingChanged(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish, noReconcile)
 	}()
 
 	time.Sleep(150 * time.Millisecond) // ~15 ticks
@@ -605,7 +602,7 @@ func TestLeaderLoop_IntervalPublishesOnceThenStops(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish, noReconcile)
 	}()
 
 	time.Sleep(150 * time.Millisecond) // ~15 ticks, one pending change
@@ -628,7 +625,7 @@ func TestLeaderLoop_ShutdownFlushSkippedWhenNothingPending(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.runLeaderLoop(ctx, timings, neverFails, rec.publish)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish, noReconcile)
 	}()
 
 	time.Sleep(20 * time.Millisecond)
@@ -680,5 +677,540 @@ func TestMarkPublished_WindowResetsAfterAWrite(t *testing.T) {
 
 	if exposure, _ := s.markPublished(s.cacheVersion()); exposure != 0 {
 		t.Fatalf("expected no window when the cache and snapshot already agree, got %s", exposure)
+	}
+}
+
+func TestSeedPredatesSubscription_DetectsTheStartupWindow(t *testing.T) {
+	created := time.Now()
+	cases := map[string]struct {
+		snapshotReadAt, subscriptionCreatedAt time.Time
+		wantBehind                            bool
+		wantWindow                            time.Duration
+	}{
+		"snapshot older than the subscription": {
+			snapshotReadAt: created.Add(-8 * time.Second), subscriptionCreatedAt: created,
+			wantBehind: true, wantWindow: 8 * time.Second,
+		},
+		"snapshot newer than the subscription": {
+			snapshotReadAt: created.Add(2 * time.Second), subscriptionCreatedAt: created,
+		},
+		"empty snapshot queue": {
+			subscriptionCreatedAt: created,
+		},
+		"subscription never opened": {
+			snapshotReadAt: created,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := &compactedTopicState{
+				snapshotReadAt:        tc.snapshotReadAt,
+				subscriptionCreatedAt: tc.subscriptionCreatedAt,
+			}
+
+			behind, window := s.seedPredatesSubscription()
+			if behind != tc.wantBehind {
+				t.Fatalf("behind = %v, want %v", behind, tc.wantBehind)
+			}
+			if window != tc.wantWindow {
+				t.Errorf("window = %s, want %s", window, tc.wantWindow)
+			}
+		})
+	}
+}
+
+func TestRunLeaderElection_HoldBackHonoursCancellation(t *testing.T) {
+	s := &compactedTopicState{topic: "cache-holdback", seeded: true, electionHoldBack: time.Hour}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	s.runLeaderElection(ctx)
+
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("returned after %s; the hold-back ignored cancellation", elapsed)
+	}
+}
+
+func TestWaitUntilSeeded_ProceedsImmediatelyWhenAlreadySeeded(t *testing.T) {
+	s := newTestCompactedState()
+	s.seeded = true
+
+	start := time.Now()
+	if !s.waitUntilSeeded(context.Background()) {
+		t.Fatal("reported a failure for a cache that was already seeded")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waited %s on an already-seeded cache; the hold-back would be paid twice", elapsed)
+	}
+}
+
+func TestSeedFromSnapshot_RefusesToSeedOverLiveChanges(t *testing.T) {
+	s := newTestCompactedState()
+	s.applyToCache(&connectors.Message{Key: []byte("topic:cb"), Value: []byte(`{"state":"active"}`)})
+
+	err := s.seedFromSnapshot(context.Background())
+	if !errors.Is(err, errCacheAlreadyLive) {
+		t.Fatalf("seedFromSnapshot() error = %v, want errCacheAlreadyLive", err)
+	}
+	if got := len(s.cache); got != 1 {
+		t.Fatalf("cache holds %d keys, want 1 — the live change was not preserved", got)
+	}
+}
+
+func TestShouldSeedLeaderSession_AsksTheQueueNotTheError(t *testing.T) {
+	cases := map[string]struct {
+		active   int32
+		probeErr error
+		want     bool
+	}{
+		"empty queue needs an anchor":       {0, nil, true},
+		"anchor already present":            {1, nil, false},
+		"several anchors already present":   {2, nil, false},
+		"probe failed, seed to stay usable": {0, errors.New("probe unavailable"), true},
+		"probe failed despite an anchor":    {1, errors.New("probe unavailable"), true},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := shouldSeedLeaderSession(tc.active, tc.probeErr); got != tc.want {
+				t.Fatalf("shouldSeedLeaderSession(%d, %v) = %v, want %v",
+					tc.active, tc.probeErr, got, tc.want)
+			}
+		})
+	}
+}
+
+func queueRuntimePropertiesXML(activeCount int) string {
+	return `<entry xmlns="http://www.w3.org/2005/Atom">` +
+		`<title type="text">lock-queue</title>` +
+		`<content type="application/xml">` +
+		`<QueueDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect" ` +
+		`xmlns:i="http://www.w3.org/2001/XMLSchema-instance">` +
+		`<LockDuration>PT1M</LockDuration>` +
+		`<RequiresSession>true</RequiresSession>` +
+		`<MaxDeliveryCount>10</MaxDeliveryCount>` +
+		// Required: the SDK parses these as RFC3339 and errors on an empty value.
+		`<AccessedAt>2026-10-05T12:00:00Z</AccessedAt>` +
+		`<CreatedAt>2026-10-05T11:00:00Z</CreatedAt>` +
+		`<UpdatedAt>2026-10-05T11:00:00Z</UpdatedAt>` +
+		fmt.Sprintf(`<MessageCount>%d</MessageCount>`, activeCount) +
+		`<CountDetails xmlns:d2p1="http://schemas.microsoft.com/netservices/2011/06/servicebus">` +
+		fmt.Sprintf(`<d2p1:ActiveMessageCount>%d</d2p1:ActiveMessageCount>`, activeCount) +
+		`<d2p1:DeadLetterMessageCount>0</d2p1:DeadLetterMessageCount>` +
+		`</CountDetails>` +
+		`</QueueDescription></content></entry>`
+}
+
+func TestSeedLeaderSession_ExistingAnchorIsNotReseeded(t *testing.T) {
+	// The leak: an anchor is never consumed, so a second one stays forever. The
+	// queue's own count is the only reliable signal, because an acquisition can
+	// fail as a held session, a Service Bus timeout, or its own context deadline,
+	// and only the first two are distinguishable from the error.
+	sender := &fakeSender{}
+	driver, _ := mockAdmin(t, func(req *http.Request) (*http.Response, error) {
+		body := queueRuntimePropertiesXML(1)
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Status:        "200 OK",
+			Header:        http.Header{"Content-Type": []string{"application/atom+xml"}},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+			Request:       req,
+		}, nil
+	})
+	driver.publisher = testPublisher(sender)
+	s := &compactedTopicState{
+		topic:     testTopic,
+		lockQueue: leaderLockQueueName(testTopic),
+		driver:    driver,
+	}
+
+	// The election loop calls this on every failed attempt, a few seconds apart.
+	for i := 0; i < 20; i++ {
+		s.seedLeaderSessionBestEffort(context.Background())
+	}
+
+	if len(sender.sent) != 0 {
+		t.Fatalf("sent %d anchors while one already existed, want 0 — every extra anchor "+
+			"stays in the lock queue permanently", len(sender.sent))
+	}
+}
+
+func TestSeedLeaderSession_UnreadableQueueStillSeeds(t *testing.T) {
+	sender := &fakeSender{}
+	driver, _ := mockAdmin(t, func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("probe unavailable")
+	})
+	driver.publisher = testPublisher(sender)
+	s := &compactedTopicState{
+		topic:     testTopic,
+		lockQueue: leaderLockQueueName(testTopic),
+		driver:    driver,
+	}
+
+	s.seedLeaderSessionBestEffort(context.Background())
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent %d anchors, want 1 — an unreadable queue must not stop the seed, "+
+			"or a transient admin failure leaves the topic permanently leaderless", len(sender.sent))
+	}
+	if got := sender.sent[0]; got.SessionID == nil || *got.SessionID != leaderSessionID {
+		t.Fatalf("anchor session = %v, want %q — without it the message creates no session",
+			got.SessionID, leaderSessionID)
+	}
+	if got := sender.sent[0]; got.MessageID == nil || *got.MessageID != leaderSeedMessageID {
+		t.Fatalf("anchor message id = %v, want %q — duplicate detection is the backstop when "+
+			"two instances probe an empty queue at the same moment", got.MessageID, leaderSeedMessageID)
+	}
+}
+
+// fakeSnapshotReceiver replays scripted peek and receive batches, so the paging
+// and the mark boundary can be exercised without a namespace.
+type fakeSnapshotReceiver struct {
+	peekPages [][]*azservicebus.ReceivedMessage
+	peekFrom  []int64 // FromSequenceNumber per call; 0 when unset
+	peekErr   error
+
+	recvBatches [][]*azservicebus.ReceivedMessage
+	recvSizes   []int
+	recvErr     error
+
+	completed []int64
+	abandoned []int64
+}
+
+func snapshotMessage(seq int64) *azservicebus.ReceivedMessage {
+	return &azservicebus.ReceivedMessage{SequenceNumber: &seq, Body: []byte("{}")}
+}
+
+func (f *fakeSnapshotReceiver) PeekMessages(_ context.Context, _ int,
+	options *azservicebus.PeekMessagesOptions) ([]*azservicebus.ReceivedMessage, error) {
+	if f.peekErr != nil {
+		return nil, f.peekErr
+	}
+	var from int64
+	if options != nil && options.FromSequenceNumber != nil {
+		from = *options.FromSequenceNumber
+	}
+	f.peekFrom = append(f.peekFrom, from)
+	if len(f.peekPages) == 0 {
+		return nil, nil
+	}
+	page := f.peekPages[0]
+	f.peekPages = f.peekPages[1:]
+	return page, nil
+}
+
+func (f *fakeSnapshotReceiver) ReceiveMessages(_ context.Context, maxMessages int,
+	_ *azservicebus.ReceiveMessagesOptions) ([]*azservicebus.ReceivedMessage, error) {
+	if f.recvErr != nil {
+		return nil, f.recvErr
+	}
+	f.recvSizes = append(f.recvSizes, maxMessages)
+	if len(f.recvBatches) == 0 {
+		return nil, nil
+	}
+	batch := f.recvBatches[0]
+	f.recvBatches = f.recvBatches[1:]
+	return batch, nil
+}
+
+func (f *fakeSnapshotReceiver) CompleteMessage(_ context.Context, msg *azservicebus.ReceivedMessage,
+	_ *azservicebus.CompleteMessageOptions) error {
+	f.completed = append(f.completed, *msg.SequenceNumber)
+	return nil
+}
+
+func (f *fakeSnapshotReceiver) AbandonMessage(_ context.Context, msg *azservicebus.ReceivedMessage,
+	_ *azservicebus.AbandonMessageOptions) error {
+	f.abandoned = append(f.abandoned, *msg.SequenceNumber)
+	return nil
+}
+
+func TestPeekAllSnapshots_PagesPastTheFirstWindow(t *testing.T) {
+	// A fixed window would stop at the first page and seed from seq 2, which is
+	// precisely how a failed cleanup turns into a silently stale restore.
+	f := &fakeSnapshotReceiver{peekPages: [][]*azservicebus.ReceivedMessage{
+		{snapshotMessage(1), snapshotMessage(2)},
+		{snapshotMessage(3)},
+	}}
+
+	newest, seqs, err := peekAllSnapshots(context.Background(), f)
+	if err != nil {
+		t.Fatalf("peekAllSnapshots: %v", err)
+	}
+	if *newest.SequenceNumber != 3 {
+		t.Errorf("newest snapshot is seq %d, want 3: the page beyond the first window was not read",
+			*newest.SequenceNumber)
+	}
+	if len(seqs) != 3 {
+		t.Errorf("found %d sequence numbers, want 3", len(seqs))
+	}
+	if want := []int64{0, 3, 4}; !slices.Equal(f.peekFrom, want) {
+		t.Errorf("peeked from %v, want %v: the cursor must advance past the last sequence seen", f.peekFrom, want)
+	}
+}
+
+func TestPeekAllSnapshots_ReportsNothingForAnEmptyQueue(t *testing.T) {
+	newest, seqs, err := peekAllSnapshots(context.Background(), &fakeSnapshotReceiver{})
+	if err != nil {
+		t.Fatalf("peekAllSnapshots: %v", err)
+	}
+	if newest != nil || len(seqs) != 0 {
+		t.Errorf("got newest=%v seqs=%v, want nothing for an empty queue", newest, seqs)
+	}
+}
+
+func TestSettleStaleSnapshots_CollectsEveryCopyBelowTheMark(t *testing.T) {
+	// The convergence property: one pass clears whatever earlier passes left,
+	// so the queue returns to a single message rather than drifting upward.
+	f := &fakeSnapshotReceiver{recvBatches: [][]*azservicebus.ReceivedMessage{
+		{snapshotMessage(1), snapshotMessage(2), snapshotMessage(3)},
+		{snapshotMessage(4), snapshotMessage(5)},
+	}}
+
+	deleted, err := settleStaleSnapshots(context.Background(), f, 5, 5)
+	if err != nil {
+		t.Fatalf("settleStaleSnapshots: %v", err)
+	}
+	if deleted != 5 {
+		t.Errorf("deleted %d, want 5", deleted)
+	}
+	if want := []int64{1, 2, 3, 4, 5}; !slices.Equal(f.completed, want) {
+		t.Errorf("completed %v, want %v", f.completed, want)
+	}
+	if len(f.abandoned) != 0 {
+		t.Errorf("abandoned %v, want none: every copy was below the mark", f.abandoned)
+	}
+}
+
+func TestSettleStaleSnapshots_NeverDeletesAboveTheMark(t *testing.T) {
+	// count is deliberately an overestimate, as it is on a retry. The mark, not
+	// the count, is what protects the newest snapshot from being deleted.
+	f := &fakeSnapshotReceiver{recvBatches: [][]*azservicebus.ReceivedMessage{
+		{snapshotMessage(1), snapshotMessage(2), snapshotMessage(3)},
+	}}
+
+	deleted, err := settleStaleSnapshots(context.Background(), f, 2, 3)
+	if err != nil {
+		t.Fatalf("settleStaleSnapshots: %v", err)
+	}
+	if deleted != 2 {
+		t.Errorf("deleted %d, want 2", deleted)
+	}
+	if want := []int64{1, 2}; !slices.Equal(f.completed, want) {
+		t.Errorf("completed %v, want %v", f.completed, want)
+	}
+	if want := []int64{3}; !slices.Equal(f.abandoned, want) {
+		t.Errorf("abandoned %v, want %v: the newest snapshot must be released, never settled", f.abandoned, want)
+	}
+}
+
+func TestSettleStaleSnapshots_SurfacesAReceiveFailure(t *testing.T) {
+	// The failure has to reach the caller, or cleanup is never retried and the
+	// extra copies stay until the next subscription.
+	f := &fakeSnapshotReceiver{recvErr: errors.New("link detached")}
+
+	deleted, err := settleStaleSnapshots(context.Background(), f, 5, 5)
+	if err == nil {
+		t.Fatal("a receive failure returned no error, so the cleanup would never be retried")
+	}
+	if deleted != 0 {
+		t.Errorf("deleted %d, want 0", deleted)
+	}
+}
+
+func TestLeaderLoop_ReconcilesWhenThereIsNothingToPublish(t *testing.T) {
+	// An unchanged topic never publishes again, so the ticker is the only thing
+	// that can collect copies a failed cleanup left behind.
+	s := newTestCompactedState()
+	rec := newPublishRecorder()
+
+	reconciled := make(chan struct{}, 1)
+	reconcile := func(context.Context) {
+		select {
+		case reconciled <- struct{}{}:
+		default:
+		}
+	}
+
+	timings := testLeaderTimings()
+	timings.snapshotInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runLeaderLoop(ctx, timings, neverFails, rec.publish, reconcile)
+	}()
+
+	select {
+	case <-reconciled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the ticker never reconciled an idle topic, so stale snapshots would persist indefinitely")
+	}
+	if rec.count() != 0 {
+		t.Errorf("published %d snapshots for an unchanged cache, want 0", rec.count())
+	}
+
+	cancel()
+	<-done
+}
+
+func TestPeekAllSnapshots_ReportsMessagesItCannotPageFrom(t *testing.T) {
+	// Paging advances off sequence numbers, so a batch carrying none used to make
+	// the loop re-read itself without end.
+	f := &fakeSnapshotReceiver{peekPages: [][]*azservicebus.ReceivedMessage{
+		{{Body: []byte("{}")}},
+	}}
+
+	_, _, err := peekAllSnapshots(context.Background(), f)
+	if err == nil {
+		t.Fatal("peekAllSnapshots() returned no error for an unpageable batch")
+	}
+	if !strings.Contains(err.Error(), "no sequence number") {
+		t.Errorf("error = %q, want it to name the missing sequence number", err)
+	}
+}
+
+func TestPeekAllSnapshots_StopsOnACancelledContext(t *testing.T) {
+	f := &fakeSnapshotReceiver{peekPages: [][]*azservicebus.ReceivedMessage{
+		{snapshotMessage(1)},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, _, err := peekAllSnapshots(ctx, f); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+// roundTripSnapshot encodes a cache and decodes it back, so a test asserts on
+// what a restarting instance would actually read.
+func roundTripSnapshot(t *testing.T, cache map[string][]byte) (map[string][]byte, []byte) {
+	t.Helper()
+	payload, err := encodeSnapshot(cache)
+	if err != nil {
+		t.Fatalf("encodeSnapshot returned error: %v", err)
+	}
+	got := make(map[string][]byte)
+	if err := decodeSnapshot(payload, func(key string, value []byte) {
+		got[key] = value
+	}); err != nil {
+		t.Fatalf("decodeSnapshot returned error: %v", err)
+	}
+	return got, payload
+}
+
+func TestSnapshotRoundTrip_WritesJSONValuesWithoutBase64(t *testing.T) {
+	value := []byte(`{"callback_url":"https://example.com/hook","state":"active"}`)
+	cache := map[string][]byte{"topic:https://example.com/hook": value}
+
+	got, payload := roundTripSnapshot(t, cache)
+
+	// The point of the encoding: the record appears as itself, not re-encoded.
+	if !bytes.Contains(payload, value) {
+		t.Fatalf("expected the snapshot to hold the record verbatim, got %s", payload)
+	}
+	if !bytes.Equal(got["topic:https://example.com/hook"], value) {
+		t.Fatalf("value did not round-trip: got %s, want %s",
+			got["topic:https://example.com/hook"], value)
+	}
+}
+
+func TestSnapshotRoundTrip_PreservesValuesThatAreNotJSONObjects(t *testing.T) {
+	cache := map[string][]byte{
+		"plain":    []byte("v"),
+		"empty":    {},
+		"array":    []byte(`["not","an","object"]`),
+		"unparsed": []byte(`{truncated`),
+	}
+
+	got, _ := roundTripSnapshot(t, cache)
+
+	if len(got) != len(cache) {
+		t.Fatalf("expected %d keys to survive, got %d", len(cache), len(got))
+	}
+	for key, want := range cache {
+		if !bytes.Equal(got[key], want) {
+			t.Errorf("key %q did not round-trip: got %q, want %q", key, got[key], want)
+		}
+	}
+}
+
+func TestDecodeSnapshot_ReadsTheBase64FormatItReplaced(t *testing.T) {
+	value := []byte(`{"state":"active"}`)
+	legacy, err := json.Marshal(map[string][]byte{"topic:cb": value})
+	if err != nil {
+		t.Fatalf("failed to build a legacy snapshot: %v", err)
+	}
+
+	got := make(map[string][]byte)
+	if err := decodeSnapshot(legacy, func(key string, v []byte) { got[key] = v }); err != nil {
+		t.Fatalf("decodeSnapshot returned error: %v", err)
+	}
+	if !bytes.Equal(got["topic:cb"], value) {
+		t.Fatalf("expected the base64 value to be decoded, got %q, want %q", got["topic:cb"], value)
+	}
+}
+
+func TestEncodeSnapshot_HoldsMoreSubscribersThanBase64Would(t *testing.T) {
+	cache := make(map[string][]byte)
+	for i := 0; i < 200; i++ {
+		callback := fmt.Sprintf("https://tenant%03d.example.com/webhooks/receive", i)
+		cache["login-success:"+callback] = []byte(fmt.Sprintf(
+			`{"id":"sub-%03d","topic":"login-success","callback_url":%q,"state":"active"}`, i, callback))
+	}
+
+	payload, err := encodeSnapshot(cache)
+	if err != nil {
+		t.Fatalf("encodeSnapshot returned error: %v", err)
+	}
+	base64Form, err := json.Marshal(cache)
+	if err != nil {
+		t.Fatalf("failed to build the base64 form: %v", err)
+	}
+
+	if len(payload) >= len(base64Form) {
+		t.Fatalf("expected the snapshot to be smaller than the base64 form, got %d vs %d",
+			len(payload), len(base64Form))
+	}
+}
+
+func TestPublishSnapshot_SendsTheCompactEncoding(t *testing.T) {
+	// Covers the write path, not just the codec: a snapshot encoded compactly but
+	// sent some other way would pass every test above. The peek fails on a
+	// cancelled context, which publishSnapshot tolerates by deferring cleanup, so
+	// the send still happens and the body can be asserted on.
+	value := []byte(`{"callback_url":"https://example.com/hook","state":"active"}`)
+	sender := &fakeSender{}
+	driver, _ := mockAdmin(t, func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("admin calls are not part of this path")
+	})
+	driver.publisher = testPublisher(sender)
+	s := &compactedTopicState{
+		topic:         testTopic,
+		snapshotQueue: snapshotQueueName(testTopic),
+		driver:        driver,
+		cache:         map[string][]byte{"topic:https://example.com/hook": value},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.publishSnapshot(ctx); err != nil {
+		t.Fatalf("publishSnapshot returned error: %v", err)
+	}
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent %d snapshots, want 1", len(sender.sent))
+	}
+	if !bytes.Contains(sender.sent[0].Body, value) {
+		t.Fatalf("the snapshot was not sent in the compact encoding, got %s", sender.sent[0].Body)
 	}
 }

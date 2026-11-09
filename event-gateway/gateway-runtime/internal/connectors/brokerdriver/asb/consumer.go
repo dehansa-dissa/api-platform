@@ -70,6 +70,10 @@ const (
 	maxMessageProcessingTime = 5 * time.Minute
 )
 
+// subscriptionSetupTimeout bounds one management call made while building a
+// consumer.
+const subscriptionSetupTimeout = 20 * time.Second
+
 // backoffDelay grows the retry interval to receiveRetryMax, with jitter so
 // replicas do not retry in lockstep.
 func backoffDelay(attempt int) time.Duration {
@@ -116,11 +120,12 @@ type Consumer struct {
 	handler  connectors.MessageHandler
 	mode     settleMode
 
+	// ephemeral subscriptions are reclaimed by Azure when idle and deleted on
+	// Stop, so a reopen must assert that same idle timeout.
 	ephemeral bool
 
-	disposable bool
-	driver     *ASBBrokerDriver
-	groupID    string
+	driver  *ASBBrokerDriver
+	groupID string
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -197,7 +202,7 @@ func (c *Consumer) reopen(ctx context.Context) error {
 	}
 
 	ensure := c.driver.ensureSubscription
-	if c.disposable {
+	if c.ephemeral {
 		ensure = c.driver.ensureDisposableSubscription
 	}
 	if err := ensure(ctx, c.topic, c.groupID); err != nil {
@@ -405,11 +410,18 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 		return nil, fmt.Errorf("asb subscribe requires at least one topic")
 	}
 
-	ctx := context.Background()
 	consumers := make([]*Consumer, 0, len(topics))
 	created := make([]string, 0, len(topics))
 
+	// Bounded per entity rather than once for the call: a callback subscribed to
+	// ten channels needs ten management round trips and should not share one
+	// budget with a single-channel one. connectors.BrokerDriver.Subscribe carries
+	// no context, so an unreachable namespace would otherwise hang the HTTP
+	// subscribe that reaches here through ConsumerManager.AddSubscription.
 	unwind := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), subscriptionSetupTimeout)
+		defer cancel()
+
 		for _, c := range consumers {
 			if err := c.receiver.Close(ctx); err != nil {
 				slog.Warn("Failed to close asb receiver during unwind", "topic", c.topic, "error", err)
@@ -432,7 +444,10 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 	}
 
 	for _, topic := range topics {
-		if err := ensure(ctx, topic, subscriptionName); err != nil {
+		ensureCtx, cancelEnsure := context.WithTimeout(context.Background(), subscriptionSetupTimeout)
+		err := ensure(ensureCtx, topic, subscriptionName)
+		cancelEnsure()
+		if err != nil {
 			unwind()
 			return nil, fmt.Errorf("failed to ensure asb subscription %s on topic %s: %w", subscriptionName, topic, err)
 		}
@@ -447,14 +462,13 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 		}
 
 		consumers = append(consumers, &Consumer{
-			receiver:   receiver,
-			topic:      topic,
-			handler:    handler,
-			mode:       mode,
-			ephemeral:  ephemeral,
-			disposable: ephemeral,
-			driver:     e,
-			groupID:    subscriptionName,
+			receiver:  receiver,
+			topic:     topic,
+			handler:   handler,
+			mode:      mode,
+			ephemeral: ephemeral,
+			driver:    e,
+			groupID:   subscriptionName,
 		})
 	}
 
@@ -472,31 +486,139 @@ func (e *ASBBrokerDriver) SubscribeManual(groupID string, topics []string, handl
 	return NewManualCommitConsumer(e, groupID, topics, handler)
 }
 
-// Watch tails a topic until ctx is cancelled. consumerID names the subscription,
-// so the read position survives a restart.
-func (e *ASBBrokerDriver) Watch(ctx context.Context, consumerID string, topic string, handler connectors.MessageHandler) (connectors.Receiver, error) {
-	subscriptionName := syncSubscriptionName(consumerID)
+// Watch delivers a compacted topic's messages to handler from the tail this
+// driver already runs for the cache, creating no subscription of its own.
+func (e *ASBBrokerDriver) Watch(_ context.Context, consumerID string, topic string,
+	handler connectors.MessageHandler) (connectors.Receiver, error) {
+	e.compactedMu.Lock()
+	state := e.compacted[topic]
+	e.compactedMu.Unlock()
 
-	if err := e.ensureDisposableSubscription(ctx, topic, subscriptionName); err != nil {
-		return nil, fmt.Errorf("failed to ensure asb watch subscription %s on topic %s: %w", subscriptionName, topic, err)
+	if state == nil {
+		return nil, fmt.Errorf("cannot watch %s: no compacted-topic tail, EnsureCompactedTopic must succeed first", topic)
 	}
 
-	receiver, err := e.client.NewReceiverForSubscription(topic, subscriptionName, &azservicebus.ReceiverOptions{
-		ReceiveMode: azservicebus.ReceiveModePeekLock,
+	slog.Info("Watch attached to the compacted-topic tail", "topic", topic, "consumer_id", consumerID)
+	return newCacheObserver(state, topic, handler), nil
+}
+
+// observerQueueDepth bounds what one observer may lag by. The cache is
+// authoritative, so a full queue is recoverable: the observer is re-primed from
+// the cache rather than blocking the tail that keeps the snapshot current.
+const observerQueueDepth = 256
+
+// cacheObserver delivers a compacted topic's messages to a handler from the tail
+// the driver already runs, so Watch costs no second subscription.
+type cacheObserver struct {
+	state   *compactedTopicState
+	topic   string
+	handler connectors.MessageHandler
+
+	queue  chan *connectors.Message
+	resync chan struct{}
+
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	once   sync.Once
+}
+
+func newCacheObserver(state *compactedTopicState, topic string, handler connectors.MessageHandler) *cacheObserver {
+	return &cacheObserver{
+		state:   state,
+		topic:   topic,
+		handler: handler,
+		queue:   make(chan *connectors.Message, observerQueueDepth),
+		resync:  make(chan struct{}, 1),
+	}
+}
+
+// Start attaches to the tail before returning, so nothing published after the
+// caller's Start can be missed.
+func (o *cacheObserver) Start(context.Context) error {
+	runCtx, cancel := context.WithCancel(context.Background())
+	o.cancel = cancel
+
+	priming := o.state.registerObserver(o)
+
+	o.wg.Add(1)
+	go func() {
+		defer o.wg.Done()
+		o.pump(runCtx, priming)
+	}()
+	return nil
+}
+
+func (o *cacheObserver) Stop(context.Context) error {
+	o.once.Do(func() {
+		o.state.removeObserver(o)
+		if o.cancel != nil {
+			o.cancel()
+		}
+		o.wg.Wait()
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create asb watch receiver for topic %s: %w", topic, err)
-	}
+	return nil
+}
 
-	return &Consumer{
-		receiver:   receiver,
-		topic:      topic,
-		handler:    handler,
-		mode:       settleAutoComplete,
-		disposable: true,
-		driver:     e,
-		groupID:    subscriptionName,
-	}, nil
+func (o *cacheObserver) pump(ctx context.Context, priming map[string][]byte) {
+	o.replay(ctx, priming)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-o.resync:
+			// Discard before reading the cache, never after.
+			dropped := o.drainQueue()
+			o.replay(ctx, o.state.snapshotCache())
+			if dropped > 0 {
+				slog.Debug("Re-primed a compacted-topic observer from cache",
+					"topic", o.topic, "superseded", dropped)
+			}
+		case msg := <-o.queue:
+			o.deliver(ctx, msg)
+		}
+	}
+}
+
+// drainQueue clears messages the next re-prime supersedes, reporting how many.
+func (o *cacheObserver) drainQueue() int {
+	dropped := 0
+	for {
+		select {
+		case <-o.queue:
+			dropped++
+		default:
+			return dropped
+		}
+	}
+}
+
+// replay hands the observer a whole cache. Used to prime a new observer and to
+// recover one that fell behind; the handler is idempotent per key, so replacing
+// state it already holds is a no-op.
+func (o *cacheObserver) replay(ctx context.Context, cache map[string][]byte) {
+	for key, value := range cache {
+		if ctx.Err() != nil {
+			return
+		}
+		o.deliver(ctx, &connectors.Message{Topic: o.topic, Key: []byte(key), Value: value})
+	}
+}
+
+func (o *cacheObserver) deliver(ctx context.Context, msg *connectors.Message) {
+	if err := o.handler(ctx, msg); err != nil {
+		slog.Error("Compacted-topic observer handler failed",
+			"topic", o.topic, "key", string(msg.Key), "error", err)
+	}
+}
+
+// markStale schedules a full re-prime. Non-blocking: a pending signal already
+// covers this one, since a re-prime replaces everything the observer holds.
+func (o *cacheObserver) markStale() {
+	select {
+	case o.resync <- struct{}{}:
+	default:
+	}
 }
 
 // ensureSubscription idempotently creates a durable subscription; 409 is success.
@@ -630,21 +752,28 @@ func receivedMessageToMessage(rm *azservicebus.ReceivedMessage, topic string) *c
 		return msg
 	}
 
-	if tombstone, ok := rm.ApplicationProperties[applyPropertyTombstone].(bool); ok && tombstone {
+	if tombstone, ok := rm.ApplicationProperties[applicationPropertyTombstone].(bool); ok && tombstone {
 		msg.Value = nil
 	} else {
 		msg.Value = rm.Body
 	}
 
-	if encodedKey, ok := rm.ApplicationProperties[applyPropertyKey].(string); ok {
-		if key, err := base64.StdEncoding.DecodeString(encodedKey); err == nil {
+	if encodedKey, ok := rm.ApplicationProperties[applicationPropertyKey].(string); ok {
+		key, err := base64.StdEncoding.DecodeString(encodedKey)
+		if err != nil {
+			slog.Warn("Discarding the key of an ASB message that did not decode",
+				"topic", topic, "sequence_number", rm.SequenceNumber, "error", err)
+		} else {
 			msg.Key = key
 		}
 	}
 
-	if encodedHeaders, ok := rm.ApplicationProperties[applyPropertyHeaders].(string); ok {
+	if encodedHeaders, ok := rm.ApplicationProperties[applicationPropertyHeaders].(string); ok {
 		var headers map[string][]string
-		if err := json.Unmarshal([]byte(encodedHeaders), &headers); err == nil {
+		if err := json.Unmarshal([]byte(encodedHeaders), &headers); err != nil {
+			slog.Warn("Discarding the headers of an ASB message that did not decode",
+				"topic", topic, "sequence_number", rm.SequenceNumber, "error", err)
+		} else {
 			msg.Headers = headers
 		}
 	}
