@@ -69,12 +69,15 @@ tls = false
 # sasl_password = "egw-pass"
 
 [asb]
-# Azure Service Bus connection string. Never commit a real value here —
-# supply it via the APIP_EGW_ASB_CONNECTION_STRING environment variable.
+# Azure Service Bus connection string. 
 # connection_string = ""
-# How long Azure keeps one of the driver's internal subscriptions alive with no
-# activity before reclaiming it.
+# Or authenticate with Entra ID instead (managed identity, or `az login`
+# locally), which carries no secret. Set one of the two, never both. The
+# identity needs the "Azure Service Bus Data Owner" role on the namespace.
+# Env: APIP_EGW_ASB_NAMESPACE
+# namespace = "example.servicebus.windows.net"
 subscription_idle_timeout_seconds = 3600
+max_delivery_count = 10
 
 [websub]
 verification_timeout_seconds = 10

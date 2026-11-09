@@ -605,7 +605,7 @@ func TestReconcileSubscription_PreservesTheOtherProperties(t *testing.T) {
 	driver, calls := mockAdmin(t, respondInOrder(t, "subscription_get_200", "subscription_update_200"))
 
 	desired := &admin.SubscriptionProperties{AutoDeleteOnIdle: to.Ptr(iso8601Seconds(30 * time.Minute))}
-	if err := driver.reconcileSubscription(context.Background(), "a-topic", "a-sub", desired); err != nil {
+	if err := driver.reconcileSubscription(context.Background(), driver.home, "a-topic", "a-sub", desired); err != nil {
 		t.Fatalf("reconcileIdleTimeout returned an error: %v", err)
 	}
 
@@ -627,7 +627,7 @@ func TestReconcileSubscription_MatchingTimeoutSkipsTheWrite(t *testing.T) {
 	driver, calls := mockAdmin(t, respondInOrder(t, "subscription_get_200"))
 
 	desired := &admin.SubscriptionProperties{AutoDeleteOnIdle: to.Ptr(iso8601Seconds(10 * time.Minute))}
-	if err := driver.reconcileSubscription(context.Background(), "a-topic", "a-sub", desired); err != nil {
+	if err := driver.reconcileSubscription(context.Background(), driver.home, "a-topic", "a-sub", desired); err != nil {
 		t.Fatalf("reconcileIdleTimeout returned an error: %v", err)
 	}
 
@@ -640,7 +640,7 @@ func TestReconcileSubscription_MissingSubscriptionIsNotAFailure(t *testing.T) {
 	driver, calls := mockAdmin(t, alwaysRespond(t, "subscription_get_missing"))
 
 	desired := &admin.SubscriptionProperties{AutoDeleteOnIdle: to.Ptr(iso8601Seconds(30 * time.Minute))}
-	if err := driver.reconcileSubscription(context.Background(), "a-topic", "gone-sub", desired); err != nil {
+	if err := driver.reconcileSubscription(context.Background(), driver.home, "a-topic", "gone-sub", desired); err != nil {
 		t.Fatalf("a reclaimed subscription is not a failure to reconcile: %v", err)
 	}
 
@@ -653,7 +653,7 @@ func TestReconcileSubscription_UpdatesAChangedMaxDeliveryCount(t *testing.T) {
 	driver, calls := mockAdmin(t, respondInOrder(t, "subscription_get_200", "subscription_update_200"))
 
 	desired := &admin.SubscriptionProperties{MaxDeliveryCount: to.Ptr(int32(20))}
-	if err := driver.reconcileSubscription(context.Background(), "a-topic", "a-sub", desired); err != nil {
+	if err := driver.reconcileSubscription(context.Background(), driver.home, "a-topic", "a-sub", desired); err != nil {
 		t.Fatalf("reconcileSubscription returned an error: %v", err)
 	}
 
@@ -676,7 +676,7 @@ func TestReconcileSubscription_MatchingPropertiesSkipTheWrite(t *testing.T) {
 		AutoDeleteOnIdle: to.Ptr(iso8601Seconds(10 * time.Minute)),
 		MaxDeliveryCount: to.Ptr(int32(10)),
 	}
-	if err := driver.reconcileSubscription(context.Background(), "a-topic", "a-sub", desired); err != nil {
+	if err := driver.reconcileSubscription(context.Background(), driver.home, "a-topic", "a-sub", desired); err != nil {
 		t.Fatalf("reconcileSubscription returned an error: %v", err)
 	}
 
@@ -717,7 +717,7 @@ func TestCreateSubscription_DurableSubscriptionSkipsTheReadBack(t *testing.T) {
 func TestConsumerStop_EphemeralDeletesItsSubscription(t *testing.T) {
 	driver, calls := mockAdmin(t, alwaysRespond(t, "topic_delete_200"))
 
-	receiver, err := driver.client.NewReceiverForSubscription("ws-topic", "grp-abc", nil)
+	receiver, err := driver.home.client.NewReceiverForSubscription("ws-topic", "grp-abc", nil)
 	if err != nil {
 		t.Fatalf("failed to build a receiver: %v", err)
 	}
@@ -745,7 +745,7 @@ func TestConsumerStop_EphemeralDeletesItsSubscription(t *testing.T) {
 func TestConsumerStop_DurableKeepsItsSubscription(t *testing.T) {
 	driver, calls := mockAdmin(t, alwaysRespond(t, "topic_delete_200"))
 
-	receiver, err := driver.client.NewReceiverForSubscription("websub-topic", "grp-xyz", nil)
+	receiver, err := driver.home.client.NewReceiverForSubscription("websub-topic", "grp-xyz", nil)
 	if err != nil {
 		t.Fatalf("failed to build a receiver: %v", err)
 	}
@@ -1058,10 +1058,8 @@ func TestCacheObserver_RePrimeSupersedesQueuedMessages(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); o.pump(ctx, nil) }()
 
-	// The value the observer is left holding is the invariant. A queued message
-	// may still be picked before the re-prime, since pump selects at random, and
-	// that is a redundant delivery rather than a regression — what must not
-	// happen is the queue outliving the re-prime and overwriting it.
+	// The value the observer ends with is the invariant: a queued message may still
+	// arrive before the re-prime, but must never overwrite it afterwards.
 	deadline := time.After(2 * time.Second)
 	var got []string
 	for {

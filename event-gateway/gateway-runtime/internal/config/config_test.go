@@ -127,6 +127,65 @@ brokers = ["localhost:9092"]
 	}
 }
 
+func TestLoadAppliesASBNamespaceEnvironmentOverride(t *testing.T) {
+	t.Setenv("APIP_EGW_ASB_NAMESPACE", "example.servicebus.windows.net")
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte(`
+[kafka]
+brokers = ["localhost:9092"]
+`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, _, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ASB.Namespace != "example.servicebus.windows.net" {
+		t.Fatalf("expected asb namespace from the environment, got %q", cfg.ASB.Namespace)
+	}
+}
+
+func TestValidateASBConfig_RejectsConnectionStringAndNamespaceTogether(t *testing.T) {
+	err := validateASBConfig(ASBConfig{
+		ConnectionString: "Endpoint=sb://example.servicebus.windows.net/;SharedAccessKeyName=test;SharedAccessKey=dGVzdA==",
+		Namespace:        "example.servicebus.windows.net",
+	})
+	if err == nil {
+		t.Fatal("expected setting both credentials to be rejected")
+	}
+}
+
+func TestValidateASBNamespace(t *testing.T) {
+	for _, valid := range []string{
+		"example.servicebus.windows.net",
+		"asgardeo-events-01.servicebus.windows.net",
+		"example.servicebus.chinacloudapi.cn",
+	} {
+		if err := ValidateASBNamespace(valid); err != nil {
+			t.Errorf("ValidateASBNamespace(%q) = %v, want nil", valid, err)
+		}
+	}
+	for _, invalid := range []string{
+		"",
+		"example",
+		"sb://example.servicebus.windows.net",
+		"https://example.servicebus.windows.net",
+		"example.servicebus.windows.net/",
+		"example.servicebus.windows.net:5671",
+		"example.servicebus.windows.net/path",
+		"user@example.servicebus.windows.net",
+		"-example.servicebus.windows.net",
+		"example..servicebus.windows.net",
+		"exa mple.servicebus.windows.net",
+	} {
+		if err := ValidateASBNamespace(invalid); err == nil {
+			t.Errorf("ValidateASBNamespace(%q) = nil, want an error", invalid)
+		}
+	}
+}
+
 // TestLoadAppliesASBIdleTimeoutEnvironmentOverride covers the other half of the
 // env path: mapEnvValue only runs strconv.Atoi for paths it lists explicitly, so
 // an int field left off that list arrives as a string.
@@ -449,5 +508,50 @@ metrics_port = 9003
 	want := "server.websocket_port port 8080 conflicts with server.websub_http_port"
 	if err.Error() != want {
 		t.Fatalf("expected error %q, got %q", want, err.Error())
+	}
+}
+
+func TestLoadAppliesASBNamespacePoolEnvironmentOverrides(t *testing.T) {
+	t.Setenv("APIP_EGW_ASB_NAMESPACE", "example.servicebus.windows.net")
+	t.Setenv("APIP_EGW_ASB_SUBSCRIPTION_ID", "00000000-1111-2222-3333-444444444444")
+	t.Setenv("APIP_EGW_ASB_RESOURCE_GROUP", "rg-events")
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte(`
+[kafka]
+brokers = ["localhost:9092"]
+`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, _, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ASB.SubscriptionID != "00000000-1111-2222-3333-444444444444" || cfg.ASB.ResourceGroup != "rg-events" {
+		t.Fatalf("pool settings not read from the environment: %+v", cfg.ASB)
+	}
+}
+
+func TestValidateASBConfig_NamespacePool(t *testing.T) {
+	const subscriptionID = "00000000-1111-2222-3333-444444444444"
+	pool := ASBConfig{Namespace: "example.servicebus.windows.net", SubscriptionID: subscriptionID, ResourceGroup: "rg-events"}
+	if err := validateASBConfig(pool); err != nil {
+		t.Fatalf("a complete pool was rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*ASBConfig){
+		"no resource group":      func(c *ASBConfig) { c.ResourceGroup = "" },
+		"no subscription":        func(c *ASBConfig) { c.SubscriptionID = "" },
+		"no first namespace":     func(c *ASBConfig) { c.Namespace = "" },
+		"subscription not GUID":  func(c *ASBConfig) { c.SubscriptionID = "APIM-rnd-001" },
+		"resource group path":    func(c *ASBConfig) { c.ResourceGroup = "rg/../other" },
+		"resource group dot end": func(c *ASBConfig) { c.ResourceGroup = "rg." },
+	} {
+		cfg := pool
+		mutate(&cfg)
+		if err := validateASBConfig(cfg); err == nil {
+			t.Errorf("%s: accepted %+v", name, cfg)
+		}
 	}
 }

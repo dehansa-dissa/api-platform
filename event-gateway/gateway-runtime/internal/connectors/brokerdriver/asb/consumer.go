@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -35,12 +36,8 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// messageReceiver is the subset of *azservicebus.Receiver the consume path
-// uses. The SDK's type is concrete and its methods open AMQP links, which left
-// handleMessage unreachable from a test — and handleMessage is where a message
-// is settled, the difference between delivering an event once and twice. The
-// settle bug that shipped in this file got through precisely because no test
-// could call it.
+// messageReceiver is the subset of *azservicebus.Receiver the consume path uses,
+// so handleMessage, where a message is settled, can be tested without a namespace.
 type messageReceiver interface {
 	ReceiveMessages(ctx context.Context, maxMessages int, options *azservicebus.ReceiveMessagesOptions) (
 		[]*azservicebus.ReceivedMessage, error)
@@ -85,8 +82,7 @@ func backoffDelay(attempt int) time.Duration {
 }
 
 // sleepFor waits d, reporting false if ctx ended first. Every timed wait in this
-// package routes through it, so cancellation behaves the same way everywhere and
-// no waiter holds a timer past its own return.
+// package uses it, so cancellation behaves the same everywhere.
 func sleepFor(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -208,8 +204,12 @@ func (c *Consumer) reopen(ctx context.Context) error {
 	if err := ensure(ctx, c.topic, c.groupID); err != nil {
 		return err
 	}
+	conn, err := c.driver.connFor(ctx, c.topic)
+	if err != nil {
+		return err
+	}
 
-	receiver, err := c.driver.client.NewReceiverForSubscription(c.topic, c.groupID, &azservicebus.ReceiverOptions{
+	receiver, err := conn.client.NewReceiverForSubscription(c.topic, c.groupID, &azservicebus.ReceiverOptions{
 		ReceiveMode: azservicebus.ReceiveModePeekLock,
 	})
 	if err != nil {
@@ -225,9 +225,8 @@ func (c *Consumer) handleMessage(ctx context.Context, rm *azservicebus.ReceivedM
 	c.handleMessageWithBudget(ctx, rm, maxMessageProcessingTime, messageLockRenewInterval)
 }
 
-// handleMessageWithBudget takes the handler budget and renewal cadence as
-// parameters so a test can drive the lapsed-lock path in milliseconds instead
-// of the five real minutes production allows, the same shape as runHandler.
+// handleMessageWithBudget takes the budget and renewal cadence as parameters so
+// a test can drive the lapsed-lock path in milliseconds.
 func (c *Consumer) handleMessageWithBudget(ctx context.Context, rm *azservicebus.ReceivedMessage,
 	budget, renewInterval time.Duration) {
 
@@ -295,6 +294,7 @@ func (c *Consumer) handleMessageWithBudget(ctx context.Context, rm *azservicebus
 
 	if err := c.receiver.CompleteMessage(ctx, rm, nil); err != nil {
 		c.reportSettleFailure(ctx, "Failed to complete ASB message", err)
+		return
 	}
 }
 
@@ -303,8 +303,8 @@ func (c *Consumer) handleMessageWithBudget(ctx context.Context, rm *azservicebus
 func (c *Consumer) runHandler(ctx context.Context, msg *connectors.Message, budget, renewInterval time.Duration,
 	renew func(context.Context) error) (handlerErr error, lockHeld bool) {
 
-	// Derived once and never reassigned: the lockHeld read below depends on this
-	// being the timeout's own context, and an earlier version got that wrong.
+	// Never reassigned: the lockHeld read below depends on this being the
+	// timeout's own context.
 	handlerCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
@@ -413,11 +413,8 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 	consumers := make([]*Consumer, 0, len(topics))
 	created := make([]string, 0, len(topics))
 
-	// Bounded per entity rather than once for the call: a callback subscribed to
-	// ten channels needs ten management round trips and should not share one
-	// budget with a single-channel one. connectors.BrokerDriver.Subscribe carries
-	// no context, so an unreachable namespace would otherwise hang the HTTP
-	// subscribe that reaches here through ConsumerManager.AddSubscription.
+	// Each management call gets its own timeout: Subscribe carries no context, so an
+	// unreachable namespace would otherwise hang the HTTP subscribe request.
 	unwind := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), subscriptionSetupTimeout)
 		defer cancel()
@@ -446,6 +443,10 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 	for _, topic := range topics {
 		ensureCtx, cancelEnsure := context.WithTimeout(context.Background(), subscriptionSetupTimeout)
 		err := ensure(ensureCtx, topic, subscriptionName)
+		var conn *nsConn
+		if err == nil {
+			conn, err = e.connFor(ensureCtx, topic)
+		}
 		cancelEnsure()
 		if err != nil {
 			unwind()
@@ -453,7 +454,7 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 		}
 		created = append(created, topic)
 
-		receiver, err := e.client.NewReceiverForSubscription(topic, subscriptionName, &azservicebus.ReceiverOptions{
+		receiver, err := conn.client.NewReceiverForSubscription(topic, subscriptionName, &azservicebus.ReceiverOptions{
 			ReceiveMode: azservicebus.ReceiveModePeekLock,
 		})
 		if err != nil {
@@ -478,12 +479,33 @@ func newMultiTopicConsumer(e *ASBBrokerDriver, groupID string, topics []string, 
 // Subscribe creates a consumer for the given topics. The returned Receiver
 // must be Start()ed by the caller.
 func (e *ASBBrokerDriver) Subscribe(groupID string, topics []string, handler connectors.MessageHandler) (connectors.Receiver, error) {
+	if err := e.placeForSubscribe(topics); err != nil {
+		return nil, err
+	}
 	return NewConsumer(e, groupID, topics, handler)
 }
 
 // SubscribeManual creates a consumer that settles on handler outcome.
 func (e *ASBBrokerDriver) SubscribeManual(groupID string, topics []string, handler connectors.MessageHandler) (connectors.Receiver, error) {
+	if err := e.placeForSubscribe(topics); err != nil {
+		return nil, err
+	}
 	return NewManualCommitConsumer(e, groupID, topics, handler)
+}
+
+// placeForSubscribe bounds the lookup itself, since Subscribe carries no context.
+func (e *ASBBrokerDriver) placeForSubscribe(topics []string) error {
+	if len(topics) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), subscriptionSetupTimeout)
+	defer cancel()
+	for _, topic := range topics {
+		if _, err := e.connFor(ctx, topic); err != nil {
+			return fmt.Errorf("failed to find the namespace holding topic %s: %w", topic, err)
+		}
+	}
+	return nil
 }
 
 // Watch delivers a compacted topic's messages to handler from the tail this
@@ -502,9 +524,8 @@ func (e *ASBBrokerDriver) Watch(_ context.Context, consumerID string, topic stri
 	return newCacheObserver(state, topic, handler), nil
 }
 
-// observerQueueDepth bounds what one observer may lag by. The cache is
-// authoritative, so a full queue is recoverable: the observer is re-primed from
-// the cache rather than blocking the tail that keeps the snapshot current.
+// observerQueueDepth bounds how far an observer may lag. A full queue re-primes
+// it from the cache rather than blocking the tail.
 const observerQueueDepth = 256
 
 // cacheObserver delivers a compacted topic's messages to a handler from the tail
@@ -593,9 +614,8 @@ func (o *cacheObserver) drainQueue() int {
 	}
 }
 
-// replay hands the observer a whole cache. Used to prime a new observer and to
-// recover one that fell behind; the handler is idempotent per key, so replacing
-// state it already holds is a no-op.
+// replay hands the observer the whole cache, to prime it or to recover it after
+// it fell behind. The handler is idempotent per key.
 func (o *cacheObserver) replay(ctx context.Context, cache map[string][]byte) {
 	for key, value := range cache {
 		if ctx.Err() != nil {
@@ -651,11 +671,15 @@ func (e *ASBBrokerDriver) subscriptionProps(disposable bool) *admin.Subscription
 }
 
 func (e *ASBBrokerDriver) createSubscription(ctx context.Context, topic, subscriptionName string, props *admin.SubscriptionProperties) error {
+	conn, err := e.connFor(ctx, topic)
+	if err != nil {
+		return err
+	}
 	var opts *admin.CreateSubscriptionOptions
 	if props != nil {
 		opts = &admin.CreateSubscriptionOptions{Properties: props}
 	}
-	_, err := e.admin.CreateSubscription(ctx, topic, subscriptionName, opts)
+	_, err = conn.admin.CreateSubscription(ctx, topic, subscriptionName, opts)
 	if err == nil {
 		return nil
 	}
@@ -665,7 +689,7 @@ func (e *ASBBrokerDriver) createSubscription(ctx context.Context, topic, subscri
 	if props == nil {
 		return nil
 	}
-	if err := e.reconcileSubscription(ctx, topic, subscriptionName, props); err != nil {
+	if err := e.reconcileSubscription(ctx, conn, topic, subscriptionName, props); err != nil {
 		slog.Warn("Failed to update asb subscription properties",
 			"topic", topic, "subscription", subscriptionName, "error", err)
 	}
@@ -674,11 +698,11 @@ func (e *ASBBrokerDriver) createSubscription(ctx context.Context, topic, subscri
 
 // reconcileSubscription applies changed properties to an existing subscription,
 // which a 409 create leaves untouched.
-func (e *ASBBrokerDriver) reconcileSubscription(ctx context.Context, topic, subscriptionName string, desired *admin.SubscriptionProperties) error {
+func (e *ASBBrokerDriver) reconcileSubscription(ctx context.Context, conn *nsConn, topic, subscriptionName string, desired *admin.SubscriptionProperties) error {
 	if desired.AutoDeleteOnIdle == nil && desired.MaxDeliveryCount == nil {
 		return nil
 	}
-	existing, err := e.admin.GetSubscription(ctx, topic, subscriptionName, nil)
+	existing, err := conn.admin.GetSubscription(ctx, topic, subscriptionName, nil)
 	if err != nil {
 		return err
 	}
@@ -705,7 +729,7 @@ func (e *ASBBrokerDriver) reconcileSubscription(ctx context.Context, topic, subs
 		return nil
 	}
 
-	if _, err := e.admin.UpdateSubscription(ctx, topic, subscriptionName, updated, nil); err != nil {
+	if _, err := conn.admin.UpdateSubscription(ctx, topic, subscriptionName, updated, nil); err != nil {
 		return err
 	}
 	slog.Info("Updated asb subscription properties",
@@ -715,7 +739,14 @@ func (e *ASBBrokerDriver) reconcileSubscription(ctx context.Context, topic, subs
 
 // DeleteSubscription removes a subscriber's durable Subscription.
 func (e *ASBBrokerDriver) DeleteSubscription(ctx context.Context, groupID string, topic string) error {
-	if _, err := e.admin.DeleteSubscription(ctx, topic, groupID, nil); err != nil {
+	conn, err := e.connFor(ctx, topic)
+	if err != nil {
+		if errors.Is(err, errNotPlaced) {
+			return nil
+		}
+		return fmt.Errorf("failed to delete asb subscription %s on topic %s: %w", groupID, topic, err)
+	}
+	if _, err := conn.admin.DeleteSubscription(ctx, topic, groupID, nil); err != nil {
 		if isNotFoundErr(err) {
 			return nil
 		}

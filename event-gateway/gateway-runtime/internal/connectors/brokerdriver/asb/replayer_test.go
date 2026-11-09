@@ -532,13 +532,8 @@ func TestLeaderLoop_ReturnsWhenCancelledDuringDebounce(t *testing.T) {
 }
 
 func TestRunLeaderElection_WaitsRatherThanContendingWhileUnseeded(t *testing.T) {
-	// A snapshot written from an unseeded cache erases every subscriber this
-	// instance never saw, so it must not contend. The driver is nil, so contending
-	// would panic — surviving is the proof it did not.
-	//
-	// It waits rather than returning: the live tail retries seeding, and an
-	// instance that gave up here stayed demoted for the life of the process, which
-	// on a single-instance deployment means no snapshot is ever written again.
+	// An unseeded instance must wait, not contend: its snapshot would erase every
+	// subscriber it never saw. The driver is nil, so contending would panic.
 	s := newTestCompactedState()
 	if s.seeded {
 		t.Fatal("test premise broken: expected a fresh state to be unseeded")
@@ -805,10 +800,8 @@ func queueRuntimePropertiesXML(activeCount int) string {
 }
 
 func TestSeedLeaderSession_ExistingAnchorIsNotReseeded(t *testing.T) {
-	// The leak: an anchor is never consumed, so a second one stays forever. The
-	// queue's own count is the only reliable signal, because an acquisition can
-	// fail as a held session, a Service Bus timeout, or its own context deadline,
-	// and only the first two are distinguishable from the error.
+	// An anchor is never consumed, so a second one stays forever. Only the queue's
+	// own count reliably says whether one already exists.
 	sender := &fakeSender{}
 	driver, _ := mockAdmin(t, func(req *http.Request) (*http.Response, error) {
 		body := queueRuntimePropertiesXML(1)
@@ -821,7 +814,7 @@ func TestSeedLeaderSession_ExistingAnchorIsNotReseeded(t *testing.T) {
 			Request:       req,
 		}, nil
 	})
-	driver.publisher = testPublisher(sender)
+	driver.home.publisher = testPublisher(sender)
 	s := &compactedTopicState{
 		topic:     testTopic,
 		lockQueue: leaderLockQueueName(testTopic),
@@ -844,7 +837,7 @@ func TestSeedLeaderSession_UnreadableQueueStillSeeds(t *testing.T) {
 	driver, _ := mockAdmin(t, func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("probe unavailable")
 	})
-	driver.publisher = testPublisher(sender)
+	driver.home.publisher = testPublisher(sender)
 	s := &compactedTopicState{
 		topic:     testTopic,
 		lockQueue: leaderLockQueueName(testTopic),
@@ -1063,7 +1056,7 @@ func TestLeaderLoop_ReconcilesWhenThereIsNothingToPublish(t *testing.T) {
 }
 
 func TestPeekAllSnapshots_ReportsMessagesItCannotPageFrom(t *testing.T) {
-	// Paging advances off sequence numbers, so a batch carrying none used to make
+	// Paging advances off sequence numbers, so a batch carrying none would make
 	// the loop re-read itself without end.
 	f := &fakeSnapshotReceiver{peekPages: [][]*azservicebus.ReceivedMessage{
 		{{Body: []byte("{}")}},
@@ -1184,16 +1177,14 @@ func TestEncodeSnapshot_HoldsMoreSubscribersThanBase64Would(t *testing.T) {
 }
 
 func TestPublishSnapshot_SendsTheCompactEncoding(t *testing.T) {
-	// Covers the write path, not just the codec: a snapshot encoded compactly but
-	// sent some other way would pass every test above. The peek fails on a
-	// cancelled context, which publishSnapshot tolerates by deferring cleanup, so
-	// the send still happens and the body can be asserted on.
+	// Covers the write path, not just the codec. The peek fails on a cancelled
+	// context, which publishSnapshot tolerates, so the send still happens.
 	value := []byte(`{"callback_url":"https://example.com/hook","state":"active"}`)
 	sender := &fakeSender{}
 	driver, _ := mockAdmin(t, func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("admin calls are not part of this path")
 	})
-	driver.publisher = testPublisher(sender)
+	driver.home.publisher = testPublisher(sender)
 	s := &compactedTopicState{
 		topic:         testTopic,
 		snapshotQueue: snapshotQueueName(testTopic),

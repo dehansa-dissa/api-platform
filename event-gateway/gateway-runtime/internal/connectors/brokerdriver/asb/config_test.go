@@ -69,6 +69,68 @@ func TestResolveConnectionConfig_RejectsNonStringOverride(t *testing.T) {
 	}
 }
 
+func TestResolveConnectionConfig_UsesGlobalNamespace(t *testing.T) {
+	resolved, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{Namespace: " Example.ServiceBus.Windows.NET "}, nil)
+	if err != nil {
+		t.Fatalf("ResolveConnectionConfig returned error: %v", err)
+	}
+	if resolved.Namespace != "example.servicebus.windows.net" || resolved.ConnectionString != "" {
+		t.Fatalf("expected the normalised global namespace and no connection string, got %+v", resolved)
+	}
+}
+
+// A binding that names a namespace must drop the global connection string,
+// whose key belongs to a different namespace.
+func TestResolveConnectionConfig_BindingNamespaceReplacesGlobalConnectionString(t *testing.T) {
+	resolved, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{ConnectionString: validConnStr}, map[string]interface{}{
+		"namespace": "asgardeo-events-02.servicebus.windows.net",
+	})
+	if err != nil {
+		t.Fatalf("ResolveConnectionConfig returned error: %v", err)
+	}
+	if resolved.ConnectionString != "" {
+		t.Fatal("expected the global connection string to be dropped for a binding that names its own namespace")
+	}
+	if resolved.Namespace != "asgardeo-events-02.servicebus.windows.net" {
+		t.Fatalf("expected the binding namespace, got %q", resolved.Namespace)
+	}
+}
+
+func TestResolveConnectionConfig_BindingConnectionStringReplacesGlobalNamespace(t *testing.T) {
+	resolved, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{Namespace: "example.servicebus.windows.net"}, map[string]interface{}{
+		"connection_string": validConnStr,
+	})
+	if err != nil {
+		t.Fatalf("ResolveConnectionConfig returned error: %v", err)
+	}
+	if resolved.Namespace != "" || resolved.ConnectionString != validConnStr {
+		t.Fatalf("expected only the binding connection string, got %+v", resolved)
+	}
+}
+
+func TestResolveConnectionConfig_RejectsBothInOneBinding(t *testing.T) {
+	_, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{}, map[string]interface{}{
+		"connection_string": validConnStr,
+		"namespace":         "example.servicebus.windows.net",
+	})
+	if err == nil {
+		t.Fatal("expected a binding setting both connection_string and namespace to be rejected")
+	}
+}
+
+func TestResolveConnectionConfig_RejectsNamespaceThatIsNotABareHost(t *testing.T) {
+	for _, namespace := range []string{
+		"sb://example.servicebus.windows.net",
+		"example.servicebus.windows.net/",
+		"example.servicebus.windows.net:5671",
+	} {
+		_, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{}, map[string]interface{}{"namespace": namespace})
+		if err == nil {
+			t.Errorf("expected namespace %q to be rejected", namespace)
+		}
+	}
+}
+
 func TestResolveConnectionConfig_CarriesSubscriptionIdleTimeout(t *testing.T) {
 	resolved, err := ResolveConnectionConfig(runtimeconfig.ASBConfig{
 		ConnectionString:               validConnStr,
@@ -208,5 +270,29 @@ func TestResolveConnectionConfig_AcceptsMaxDeliveryCountAtInt32(t *testing.T) {
 	}
 	if resolved.MaxDeliveryCount != math.MaxInt32 {
 		t.Fatalf("MaxDeliveryCount = %d, want %d", resolved.MaxDeliveryCount, int32(math.MaxInt32))
+	}
+}
+
+func TestResolveConnectionConfig_BindingWithItsOwnNamespaceLeavesThePool(t *testing.T) {
+	global := runtimeconfig.ASBConfig{
+		ConnectionString: validConnStr,
+		SubscriptionID:   "00000000-1111-2222-3333-444444444444",
+		ResourceGroup:    "rg-events",
+	}
+
+	pooled, err := ResolveConnectionConfig(global, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pooled.SubscriptionID == "" || pooled.ResourceGroup == "" {
+		t.Fatalf("pool settings not carried to the driver: %+v", pooled)
+	}
+
+	pinned, err := ResolveConnectionConfig(global, map[string]interface{}{"namespace": "other.servicebus.windows.net"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinned.SubscriptionID != "" || pinned.ResourceGroup != "" {
+		t.Fatalf("a binding that names its namespace was still pooled: %+v", pinned)
 	}
 }

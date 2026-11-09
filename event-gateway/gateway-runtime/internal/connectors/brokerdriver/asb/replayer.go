@@ -38,10 +38,8 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// ASB has no log compaction, so each instance caches the subscription sync topic
-// and the leader writes that cache to a snapshot queue, which is the only thing a
-// restarting instance can read: a subscription receives nothing published before
-// it existed.
+// ASB has no log compaction, so each instance caches the sync topic and the leader
+// writes the cache to a snapshot queue, which a restarting instance reads.
 
 const (
 	compactionSnapshotInterval       = 30 * time.Second
@@ -115,20 +113,24 @@ type compactedTopicState struct {
 // EnsureCompactedTopic provisions the topic and its two queues, seeds the cache
 // from any existing snapshot, and starts the live-tail and election goroutines.
 func (e *ASBBrokerDriver) EnsureCompactedTopic(ctx context.Context, topic string) error {
-	if _, err := e.admin.CreateTopic(ctx, topic, nil); err != nil && !isConflictErr(err) {
+	home, err := e.homeConn(ctx, topic, true)
+	if err != nil {
+		return fmt.Errorf("failed to place compacted topic %s in a namespace: %w", topic, err)
+	}
+	if _, err := createTopic(ctx, home.admin, topic); err != nil {
 		return fmt.Errorf("failed to create compacted topic %s: %w", topic, err)
 	}
 
 	snapshotQueue := snapshotQueueName(topic)
 	lockQueue := leaderLockQueueName(topic)
 
-	if _, err := e.admin.CreateQueue(ctx, snapshotQueue, nil); err != nil && !isConflictErr(err) {
+	if _, err := home.admin.CreateQueue(ctx, snapshotQueue, nil); err != nil && !isConflictErr(err) {
 		return fmt.Errorf("failed to create snapshot queue %s: %w", snapshotQueue, err)
 	}
 
 	// LockDuration left unset: ASB's 1-minute default already clears
 	// compactionLockRenewBefore, and the field wants an ATOM-XML duration.
-	if _, err := e.admin.CreateQueue(ctx, lockQueue, &admin.CreateQueueOptions{
+	if _, err := home.admin.CreateQueue(ctx, lockQueue, &admin.CreateQueueOptions{
 		Properties: &admin.QueueProperties{
 			RequiresSession:            to.Ptr(true),
 			RequiresDuplicateDetection: to.Ptr(true),
@@ -217,6 +219,12 @@ func (e *ASBBrokerDriver) stopCompactedTopicLocked(topic string) {
 // Replay calls handler once per key in the current snapshot with that key's
 // latest value.
 func (e *ASBBrokerDriver) Replay(ctx context.Context, topic string, handler connectors.MessageHandler) error {
+	if _, err := e.homeConn(ctx, topic, false); err != nil {
+		if errors.Is(err, errNotPlaced) {
+			return nil
+		}
+		return fmt.Errorf("failed to replay snapshot for topic %s: %w", topic, err)
+	}
 	var handlerErr error
 	replayed := 0
 	_, err := e.replaySnapshotInto(ctx, snapshotQueueName(topic), func(key string, value []byte) {
@@ -238,9 +246,8 @@ func (e *ASBBrokerDriver) Replay(ctx context.Context, topic string, handler conn
 	return nil
 }
 
-// snapshotReceiver is the slice of *azservicebus.Receiver the snapshot paths
-// use. Narrow on purpose: the paging and the mark boundary below are the parts
-// worth testing, and neither needs a namespace to exercise.
+// snapshotReceiver is the subset of *azservicebus.Receiver the snapshot paths use,
+// so paging and cleanup can be tested without a namespace.
 type snapshotReceiver interface {
 	PeekMessages(ctx context.Context, maxMessageCount int, options *azservicebus.PeekMessagesOptions) (
 		[]*azservicebus.ReceivedMessage, error)
@@ -257,7 +264,7 @@ var _ snapshotReceiver = (*azservicebus.Receiver)(nil)
 // peekSnapshotQueue opens a receiver and surveys the whole queue.
 func (e *ASBBrokerDriver) peekSnapshotQueue(ctx context.Context, snapshotQueue string) (
 	*azservicebus.ReceivedMessage, []int64, error) {
-	receiver, err := e.client.NewReceiverForQueue(snapshotQueue, nil)
+	receiver, err := e.home.client.NewReceiverForQueue(snapshotQueue, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open snapshot receiver: %w", err)
 	}
@@ -334,8 +341,7 @@ func (e *ASBBrokerDriver) replaySnapshotInto(ctx context.Context, snapshotQueue 
 }
 
 // runLiveTail keeps the cache current from a per-instance subscription. receiver
-// is the one EnsureCompactedTopic opened; nil when that failed, in which case
-// this opens its own.
+// is nil when EnsureCompactedTopic could not open one, and this opens its own.
 func (s *compactedTopicState) runLiveTail(ctx context.Context, receiver *azservicebus.Receiver) {
 	subscriptionName := cacheSubscriptionName(s.driver.instanceID)
 
@@ -405,7 +411,7 @@ func (s *compactedTopicState) openCacheReceiver(ctx context.Context, subscriptio
 	if err := s.driver.ensureDisposableSubscription(ctx, s.topic, subscriptionName); err != nil {
 		return nil, fmt.Errorf("failed to ensure compacted-topic cache subscription: %w", err)
 	}
-	receiver, err := s.driver.client.NewReceiverForSubscription(s.topic, subscriptionName, &azservicebus.ReceiverOptions{
+	receiver, err := s.driver.home.client.NewReceiverForSubscription(s.topic, subscriptionName, &azservicebus.ReceiverOptions{
 		ReceiveMode: azservicebus.ReceiveModePeekLock,
 	})
 	if err != nil {
@@ -415,8 +421,7 @@ func (s *compactedTopicState) openCacheReceiver(ctx context.Context, subscriptio
 }
 
 // rebuildCacheTail recreates a reclaimed subscription and refills the cache from
-// the snapshot, the only record of what was published while it was gone. The
-// caller owns the receiver being replaced, so closing it stays with the caller.
+// the snapshot. The caller still owns, and closes, the receiver being replaced.
 func (s *compactedTopicState) rebuildCacheTail(ctx context.Context, subscriptionName string) (*azservicebus.Receiver, error) {
 	receiver, err := s.openCacheReceiver(ctx, subscriptionName)
 	if err != nil {
@@ -557,9 +562,8 @@ func (s *compactedTopicState) runLeaderElection(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			// A held session is proof the anchor is already there, so seeding
-			// again only adds a message nothing consumes. Duplicate detection
-			// suppresses a repeat inside its window and not once that rolls.
+			// A held session proves the anchor exists, so only seed when the failure
+			// was something else.
 			if !isSessionHeldErr(err) {
 				if !isSBTimeoutErr(err) {
 					slog.Warn("Leader-election attempt failed", "topic", s.topic, "error", err)
@@ -579,9 +583,8 @@ func (s *compactedTopicState) runLeaderElection(ctx context.Context) {
 	}
 }
 
-// registerObserver attaches o and returns the cache as it stood at that instant.
-// Both under one lock, so no message falls between the copy and the first live
-// delivery, and anything delivered afterwards is newer than the copy.
+// registerObserver attaches o and returns a copy of the cache, both under one
+// lock, so no message falls between the copy and the first live delivery.
 func (s *compactedTopicState) registerObserver(o *cacheObserver) map[string][]byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -761,9 +764,8 @@ func (s *compactedTopicState) waitUntilSeeded(ctx context.Context) bool {
 	return true
 }
 
-// seedPredatesSubscription reports a cache that cannot be complete: one seeded
-// from a snapshot written before this instance's subscription existed is missing
-// anything published in between. The returned duration is that window.
+// seedPredatesSubscription reports a cache seeded from a snapshot older than this
+// instance's subscription, and the window of changes it may be missing.
 func (s *compactedTopicState) seedPredatesSubscription() (bool, time.Duration) {
 	s.mu.RLock()
 	readAt, createdAt := s.snapshotReadAt, s.subscriptionCreatedAt
@@ -789,26 +791,22 @@ func (s *compactedTopicState) warnIfSeedPredatesSubscription() {
 func (s *compactedTopicState) tryAcquireLeadership(ctx context.Context) (*azservicebus.SessionReceiver, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, compactionElectionAttemptTimeout)
 	defer cancel()
-	return s.driver.client.AcceptSessionForQueue(attemptCtx, s.lockQueue, leaderSessionID, &azservicebus.SessionReceiverOptions{
+	return s.driver.home.client.AcceptSessionForQueue(attemptCtx, s.lockQueue, leaderSessionID, &azservicebus.SessionReceiverOptions{
 		ReceiveMode: azservicebus.ReceiveModePeekLock,
 	})
 }
 
-// shouldSeedLeaderSession decides whether an anchor is needed, from the lock
-// queue's own contents rather than from how an acquisition failed.
-//
-// The session exists if and only if the queue holds a message in it, so the
-// count answers the question directly.
+// shouldSeedLeaderSession reports whether an anchor is needed. The session exists
+// only while the lock queue holds a message, so the count answers directly.
 func shouldSeedLeaderSession(activeCount int32, probeErr error) bool {
 	return probeErr != nil || activeCount == 0
 }
 
 // seedLeaderSessionBestEffort creates the "leader" session by sending an anchor,
-// but only when the queue has none. The probe is the whole guard: a per-process
-// flag used to stand in for it, which capped failures as well as successes
+// only when the probe finds the queue empty.
 func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
 	probeCtx, cancelProbe := context.WithTimeout(ctx, snapshotIOTimeout)
-	props, probeErr := s.driver.admin.GetQueueRuntimeProperties(probeCtx, s.lockQueue, nil)
+	props, probeErr := s.driver.home.admin.GetQueueRuntimeProperties(probeCtx, s.lockQueue, nil)
 	cancelProbe()
 
 	var active int32
@@ -821,9 +819,9 @@ func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
 		return
 	}
 
-	defer s.driver.publisher.closeSender(s.lockQueue)
+	defer s.driver.home.publisher.closeSender(s.lockQueue)
 
-	sender, err := s.driver.publisher.senderFor(s.lockQueue)
+	sender, err := s.driver.home.publisher.senderFor(s.lockQueue)
 	if err != nil {
 		slog.Warn("Failed to open leader-lock seed sender", "topic", s.topic, "error", err)
 		return
@@ -839,8 +837,7 @@ func (s *compactedTopicState) seedLeaderSessionBestEffort(ctx context.Context) {
 		return
 	}
 
-	// Logged because a silent seed is what made this leak take three rounds to
-	// find: the anchor is never consumed, so every extra one stays forever.
+	// Logged because an anchor is never consumed, so every extra one stays forever.
 	slog.Info("Seeded the leader-lock session", "topic", s.topic, "probe_error", probeErr)
 }
 
@@ -1045,9 +1042,8 @@ func (s *compactedTopicState) retryCleanup(ctx context.Context) {
 	s.cleanupStaleSnapshots(ctx, mark, stale)
 }
 
-// encodeSnapshot marshals the cache, writing a value that is already a JSON
-// object as itself. json.Marshal renders a []byte as base64, which costs a third
-// of every subscriber record and is what bounds how many subscribers one snapshot holds.
+// encodeSnapshot marshals the cache, writing JSON-object values as themselves
+// rather than as base64, which keeps the snapshot a third smaller.
 func encodeSnapshot(cache map[string][]byte) ([]byte, error) {
 	raw := make(map[string]json.RawMessage, len(cache))
 	for key, value := range cache {
@@ -1103,7 +1099,7 @@ func (s *compactedTopicState) publishSnapshot(ctx context.Context) error {
 			"topic", s.topic, "error", peekErr)
 	}
 
-	sender, err := s.driver.publisher.senderFor(s.snapshotQueue)
+	sender, err := s.driver.home.publisher.senderFor(s.snapshotQueue)
 	if err != nil {
 		return fmt.Errorf("failed to open snapshot sender: %w", err)
 	}
@@ -1134,7 +1130,7 @@ func (s *compactedTopicState) cleanupStaleSnapshots(ctx context.Context, mark in
 		return
 	}
 
-	receiver, err := s.driver.client.NewReceiverForQueue(s.snapshotQueue, &azservicebus.ReceiverOptions{
+	receiver, err := s.driver.home.client.NewReceiverForQueue(s.snapshotQueue, &azservicebus.ReceiverOptions{
 		ReceiveMode: azservicebus.ReceiveModePeekLock,
 	})
 	if err != nil {

@@ -94,9 +94,16 @@ type KafkaConfig struct {
 
 // ASBConfig holds Azure Service Bus connection settings.
 type ASBConfig struct {
-	ConnectionString               string `koanf:"connection_string"`
+	ConnectionString string `koanf:"connection_string"`
+	// Namespace is a fully qualified namespace authenticated through Entra ID.
+	// Unlike ConnectionString it carries no secret; at most one of the two is set.
+	Namespace                      string `koanf:"namespace"`
 	SubscriptionIdleTimeoutSeconds int    `koanf:"subscription_idle_timeout_seconds"`
 	MaxDeliveryCount               int    `koanf:"max_delivery_count"`
+	// SubscriptionID and ResourceGroup let the driver create namespaces beside
+	// the configured one; leave both empty to use only that namespace.
+	SubscriptionID string `koanf:"subscription_id"`
+	ResourceGroup  string `koanf:"resource_group"`
 }
 
 // WebSubConfig holds WebSub-specific settings.
@@ -452,13 +459,109 @@ func validateASBConfig(asbCfg ASBConfig) error {
 	if asbCfg.MaxDeliveryCount < 0 || asbCfg.MaxDeliveryCount > math.MaxInt32 {
 		return fmt.Errorf("asb.max_delivery_count must be between 0 and %d, got %d", math.MaxInt32, asbCfg.MaxDeliveryCount)
 	}
-	if strings.TrimSpace(asbCfg.ConnectionString) == "" {
+	connectionString := strings.TrimSpace(asbCfg.ConnectionString)
+	namespace := strings.TrimSpace(asbCfg.Namespace)
+	if connectionString != "" && namespace != "" {
+		return fmt.Errorf("asb.connection_string and asb.namespace are mutually exclusive; set one")
+	}
+	if err := validateASBNamespacePool(asbCfg, connectionString != "" || namespace != ""); err != nil {
+		return err
+	}
+	if namespace != "" {
+		if err := ValidateASBNamespace(namespace); err != nil {
+			return fmt.Errorf("asb.namespace: %w", err)
+		}
 		return nil
 	}
-	if !strings.HasPrefix(strings.TrimSpace(asbCfg.ConnectionString), "Endpoint=sb://") {
+	if connectionString == "" {
+		return nil
+	}
+	if !strings.HasPrefix(connectionString, "Endpoint=sb://") {
 		return fmt.Errorf("asb.connection_string must be a valid Service Bus connection string starting with \"Endpoint=sb://\"")
 	}
 	return nil
+}
+
+// ValidateASBNamespace accepts only a bare host (example.servicebus.windows.net).
+// A URL is rejected, not stripped, as the SDK builds both endpoints from it.
+func ValidateASBNamespace(namespace string) error {
+	if namespace == "" {
+		return fmt.Errorf("namespace must not be empty")
+	}
+	if len(namespace) > 253 {
+		return fmt.Errorf("namespace must be at most 253 characters")
+	}
+	labels := strings.Split(namespace, ".")
+	if len(labels) < 2 {
+		return fmt.Errorf("namespace must be a fully qualified host such as example.servicebus.windows.net")
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return fmt.Errorf("namespace must be a bare host name with no scheme, port or path")
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("namespace must be a bare host name with no scheme, port or path")
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+				return fmt.Errorf("namespace must be a bare host name with no scheme, port or path")
+			}
+		}
+	}
+	return nil
+}
+
+// validateASBNamespacePool refuses a half-configured pool.
+func validateASBNamespacePool(asbCfg ASBConfig, hasTarget bool) error {
+	subscriptionID := strings.TrimSpace(asbCfg.SubscriptionID)
+	resourceGroup := strings.TrimSpace(asbCfg.ResourceGroup)
+	if subscriptionID == "" && resourceGroup == "" {
+		return nil
+	}
+	if subscriptionID == "" || resourceGroup == "" {
+		return fmt.Errorf("asb.subscription_id and asb.resource_group must be set together")
+	}
+	if !hasTarget {
+		return fmt.Errorf("asb.subscription_id needs asb.connection_string or asb.namespace to name the first namespace")
+	}
+	if !isGUID(subscriptionID) {
+		return fmt.Errorf("asb.subscription_id must be a subscription GUID")
+	}
+	if !isResourceGroupName(resourceGroup) {
+		return fmt.Errorf("asb.resource_group must be 1-90 letters, digits, '-', '_', '.', '(' or ')', not ending in '.'")
+	}
+	return nil
+}
+
+func isGUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if r != '-' {
+				return false
+			}
+			continue
+		}
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func isResourceGroupName(s string) bool {
+	if len(s) == 0 || len(s) > 90 || strings.HasSuffix(s, ".") {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '-' || r == '_' || r == '.' || r == '(' || r == ')') {
+			return false
+		}
+	}
+	return true
 }
 
 // validateListenerTLSTuning validates the optional min/max TLS version,

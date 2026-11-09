@@ -34,10 +34,8 @@ import (
 	"github.com/wso2/api-platform/event-gateway/gateway-runtime/internal/connectors"
 )
 
-// messageSender is the subset of *azservicebus.Sender the publish path uses,
-// for the same reason as messageReceiver in consumer.go: Publish encodes the
-// message, and what a fake records is the only way to assert what actually
-// reached the wire without a namespace.
+// messageSender is the subset of *azservicebus.Sender the publish path uses, so a
+// test can assert what reached the wire without a namespace.
 type messageSender interface {
 	SendMessage(ctx context.Context, message *azservicebus.Message, options *azservicebus.SendMessageOptions) error
 	Close(ctx context.Context) error

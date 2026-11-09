@@ -218,7 +218,7 @@ func TestEnsureTopics_ServerFailureAbortsStartup(t *testing.T) {
 func TestDeleteCompactionQueues_MissingQueuesAreExpected(t *testing.T) {
 	driver, calls := mockAdmin(t, alwaysRespond(t, "queue_delete_404"))
 
-	driver.deleteCompactionQueues(context.Background(), "a-topic")
+	driver.deleteCompactionQueues(context.Background(), driver.home, "a-topic")
 
 	if len(*calls) != 2 {
 		t.Fatalf("expected the snapshot and leader-lock queues to be attempted, got %d calls", len(*calls))

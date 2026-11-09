@@ -33,8 +33,14 @@ const minSubscriptionIdleTimeout = 5 * time.Minute
 // ConnectionConfig holds the Azure Service Bus connection settings used by the driver.
 type ConnectionConfig struct {
 	ConnectionString        string
+	Namespace               string
 	SubscriptionIdleTimeout time.Duration
 	MaxDeliveryCount        int32
+
+	// Set only when the driver may place a WebSubApi in, and create, namespaces
+	// beside the configured one. See namespace_pool.go.
+	SubscriptionID string
+	ResourceGroup  string
 }
 
 // ResolveConnectionConfig merges global runtime config with per-binding overrides.
@@ -45,15 +51,35 @@ func ResolveConnectionConfig(global config.ASBConfig, overrides map[string]inter
 
 	cfg := ConnectionConfig{
 		ConnectionString:        global.ConnectionString,
+		Namespace:               global.Namespace,
 		SubscriptionIdleTimeout: time.Duration(global.SubscriptionIdleTimeoutSeconds) * time.Second,
 		MaxDeliveryCount:        int32(global.MaxDeliveryCount),
+		SubscriptionID:          global.SubscriptionID,
+		ResourceGroup:           global.ResourceGroup,
 	}
 
 	if overrides != nil {
-		if v, ok, err := stringOverride(overrides["connection_string"]); err != nil {
+		connectionString, hasConnectionString, err := stringOverride(overrides["connection_string"])
+		if err != nil {
 			return ConnectionConfig{}, err
-		} else if ok {
-			cfg.ConnectionString = v
+		}
+		namespace, hasNamespace, err := stringOverride(overrides["namespace"])
+		if err != nil {
+			return ConnectionConfig{}, err
+		}
+		if hasConnectionString && hasNamespace {
+			return ConnectionConfig{}, fmt.Errorf("asb binding config must set connection_string or namespace, not both")
+		}
+		// A binding that names its own target replaces both global fields, so it
+		// never pairs its namespace with a credential the runtime held for another.
+		switch {
+		case hasConnectionString:
+			cfg.ConnectionString, cfg.Namespace = connectionString, ""
+		case hasNamespace:
+			cfg.ConnectionString, cfg.Namespace = "", namespace
+		}
+		if hasConnectionString || hasNamespace {
+			cfg.SubscriptionID, cfg.ResourceGroup = "", ""
 		}
 	}
 
@@ -66,15 +92,24 @@ func ResolveConnectionConfig(global config.ASBConfig, overrides map[string]inter
 
 func normalizeConnectionConfig(cfg *ConnectionConfig) {
 	cfg.ConnectionString = strings.TrimSpace(cfg.ConnectionString)
+	cfg.Namespace = strings.ToLower(strings.TrimSpace(cfg.Namespace))
+	cfg.SubscriptionID = strings.TrimSpace(cfg.SubscriptionID)
+	cfg.ResourceGroup = strings.TrimSpace(cfg.ResourceGroup)
 }
 
 // validateConnectionConfig fails closed so a misconfigured binding is rejected
 // at startup rather than on first use.
 func validateConnectionConfig(cfg ConnectionConfig) error {
-	if cfg.ConnectionString == "" {
-		return fmt.Errorf("asb connection string must not be empty")
-	}
-	if !strings.HasPrefix(cfg.ConnectionString, "Endpoint=sb://") {
+	switch {
+	case cfg.ConnectionString != "" && cfg.Namespace != "":
+		return fmt.Errorf("asb connection string and namespace are mutually exclusive")
+	case cfg.Namespace != "":
+		if err := config.ValidateASBNamespace(cfg.Namespace); err != nil {
+			return fmt.Errorf("asb %w", err)
+		}
+	case cfg.ConnectionString == "":
+		return fmt.Errorf("asb connection string or namespace must be set")
+	case !strings.HasPrefix(cfg.ConnectionString, "Endpoint=sb://"):
 		return fmt.Errorf("asb connection string is malformed: expected it to start with \"Endpoint=sb://\"")
 	}
 	if cfg.SubscriptionIdleTimeout < 0 {
